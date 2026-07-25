@@ -25,27 +25,21 @@ const tinytcp = @import("tinytcp");
 var link = tinytcp.link.ChannelEndpoint.init();
 var stack = tinytcp.init(&link, .{ 10, 0, 0, 1 });
 
-// Create a server — handles event dispatch automatically
 var server = tinytcp.Server.init(&stack);
 _ = server.listen(80, 8);
 
 // Event loop
 while (true) {
-    const event = stack.injectPacket(now_ms, pkt);
-    switch (server.handle(event)) {
-        .accepted => |stream| {
-            // new connection ready
-            _ = stream;
-        },
+    switch (server.injectPacket(now_ms, pkt)) {
+        .accepted => |stream| _ = stream,
         .data => |stream| {
             var buf: [4096]u8 = undefined;
             const n = stream.recv(&buf);
             _ = stream.send(buf[0..n]); // echo
         },
-        .closed => {},
-        .aborted, .none => {},
+        .closed, .aborted, .none => {},
     }
-    _ = stack.poll(now_ms);
+    _ = server.poll(now_ms);
 }
 ```
 
@@ -82,18 +76,16 @@ pub fn main() !void {
     var server_stack = tinytcp.init(&link_a, .{ 10, 0, 0, 1 });
     var client_stack = tinytcp.init(&link_b, .{ 10, 0, 0, 2 });
 
-    // Server side
     var server = tinytcp.Server.init(&server_stack);
     _ = server.listen(80, 4);
 
-    // Client side
     var stream = tinytcp.Stream.connect(&client_stack, 0, .{ 10, 0, 0, 1 }, 80) orelse return;
     _ = client_stack.poll(0);
 
     // Pump until handshake
     var t: u64 = 1;
     while (t < 50) : (t += 1) {
-        pumpToServer(&link_b, &server_stack, &server, t);
+        pump(&link_b, &server, t);
         pumpRaw(&link_a, &client_stack, t);
     }
 
@@ -101,14 +93,13 @@ pub fn main() !void {
     _ = stream.send("hello tinytcp");
     _ = client_stack.poll(t);
     t += 1;
-    pumpToServer(&link_b, &server_stack, &server, t);
+    pump(&link_b, &server, t);
 }
 
-fn pumpToServer(src: anytype, dst: anytype, srv: anytype, now: u64) void {
+fn pump(src: anytype, srv: anytype, now: u64) void {
     var buf: [1600]u8 = undefined;
     while (src.readOutbound(&buf)) |pkt| {
-        const event = dst.injectPacket(now, pkt);
-        switch (srv.handle(event)) {
+        switch (srv.injectPacket(now, pkt)) {
             .accepted => std.debug.print("accepted\n", .{}),
             .data => |s| {
                 var rbuf: [64]u8 = undefined;
@@ -118,7 +109,7 @@ fn pumpToServer(src: anytype, dst: anytype, srv: anytype, now: u64) void {
             .closed, .aborted, .none => {},
         }
     }
-    _ = dst.poll(now);
+    _ = srv.poll(now);
 }
 
 fn pumpRaw(src: anytype, dst: anytype, now: u64) void {

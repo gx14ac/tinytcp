@@ -1,7 +1,7 @@
 // TCP echo server — demonstrates the high-level Server API.
 //
 // Two stacks (client + server) connected via virtual link.
-// Uses tinytcp.init() for the default stack (16 connections).
+// Uses tinytcp.init() for default 16-connection stack.
 
 const std = @import("std");
 const tinytcp = @import("tinytcp");
@@ -21,10 +21,10 @@ pub fn main() !void {
     var stream = tinytcp.Stream.connect(&client_stack, 0, .{ 10, 0, 0, 1 }, 80) orelse return;
     _ = client_stack.poll(0);
 
-    // Pump packets until handshake completes, then send data
+    // Pump packets until handshake completes
     var t: u64 = 2;
     while (t < 50) : (t += 1) {
-        pumpToServer(&link_b, &server_stack, &server, t);
+        pump(&link_b, &server, t);
         pumpRaw(&link_a, &client_stack, t);
     }
 
@@ -35,18 +35,17 @@ pub fn main() !void {
 
     // Pump data to server
     while (t < 100) : (t += 1) {
-        pumpToServer(&link_b, &server_stack, &server, t);
+        pump(&link_b, &server, t);
         pumpRaw(&link_a, &client_stack, t);
     }
 }
 
-fn pumpToServer(src: *tinytcp.link.ChannelEndpoint, dst: anytype, srv: anytype, now: u64) void {
+fn pump(src: *tinytcp.link.ChannelEndpoint, srv: anytype, now: u64) void {
     var buf: [1600]u8 = undefined;
     while (src.readOutbound(&buf)) |pkt| {
-        const event = dst.injectPacket(now, pkt);
-        handleEvent(srv.handle(event));
+        handleEvent(srv.injectPacket(now, pkt));
     }
-    handleEvent(srv.handle(dst.poll(now)));
+    handleEvent(srv.poll(now));
 }
 
 fn pumpRaw(src: *tinytcp.link.ChannelEndpoint, dst: anytype, now: u64) void {

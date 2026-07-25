@@ -132,6 +132,14 @@ pub fn Tcp(comptime StackT: type) type {
                 }
             }
 
+            pub fn injectPacket(self: *Server, now_ms: u64, raw: []const u8) ServerEvent {
+                return self.handle(self.stack.injectPacket(now_ms, raw));
+            }
+
+            pub fn poll(self: *Server, now_ms: u64) ServerEvent {
+                return self.handle(self.stack.poll(now_ms));
+            }
+
             pub fn connect(self: *Server, now_ms: u64, addr: [4]u8, port: u16) ?Stream {
                 const stream = Stream.connect(self.stack, now_ms, addr, port) orelse return null;
                 self.streams[stream.idx] = true;

@@ -90,12 +90,10 @@ pub fn main() !void {
             const af = std.mem.readInt(u32, read_buf[0..4], .big);
             if (af != 2) continue;
 
-            const event = stack.injectPacket(now_ms, read_buf[4..n]);
-            handleEvent(server.handle(event), &stdout);
+            handleEvent(server.injectPacket(now_ms, read_buf[4..n]), &stdout);
         }
 
-        const poll_event = stack.poll(now_ms);
-        handleEvent(server.handle(poll_event), &stdout);
+        handleEvent(server.poll(now_ms), &stdout);
 
         while (link_ep.outboundCount() > 0) {
             const pkt = link_ep.readOutbound(out_buf[4..]) orelse break;
