@@ -22,13 +22,11 @@ Designed for embedding in VPN tunnels (WireGuard), WASM runtimes, bare-metal fir
 ```zig
 const tinytcp = @import("tinytcp");
 
-const Stack = tinytcp.Stack(16);
-
 var link = tinytcp.link.ChannelEndpoint.init();
-var stack = Stack.init(&link, .{ 10, 0, 0, 1 });
+var stack = tinytcp.init(&link, .{ 10, 0, 0, 1 });
 
 // Create a server — handles event dispatch automatically
-var server = Stack.Server.init(&stack);
+var server = tinytcp.Server.init(&stack);
 _ = server.listen(80, 8);
 
 // Event loop
@@ -51,6 +49,14 @@ while (true) {
 }
 ```
 
+For custom connection limits, use `tinytcp.Stack(N)` directly:
+
+```zig
+const Stack = tinytcp.Stack(64);
+var stack = Stack.init(&link, ip);
+var server = Stack.Server.init(&stack);
+```
+
 ## Build
 
 Requires Zig 0.15.x.
@@ -69,21 +75,19 @@ zig build echo     # run minimal example
 const std = @import("std");
 const tinytcp = @import("tinytcp");
 
-const Stack = tinytcp.Stack(4);
-
 pub fn main() !void {
     var link_a = tinytcp.link.ChannelEndpoint.init();
     var link_b = tinytcp.link.ChannelEndpoint.init();
 
-    var server_stack = Stack.init(&link_a, .{ 10, 0, 0, 1 });
-    var client_stack = Stack.init(&link_b, .{ 10, 0, 0, 2 });
+    var server_stack = tinytcp.init(&link_a, .{ 10, 0, 0, 1 });
+    var client_stack = tinytcp.init(&link_b, .{ 10, 0, 0, 2 });
 
     // Server side
-    var server = Stack.Server.init(&server_stack);
+    var server = tinytcp.Server.init(&server_stack);
     _ = server.listen(80, 4);
 
     // Client side
-    var stream = Stack.Stream.connect(&client_stack, 0, .{ 10, 0, 0, 1 }, 80) orelse return;
+    var stream = tinytcp.Stream.connect(&client_stack, 0, .{ 10, 0, 0, 1 }, 80) orelse return;
     _ = client_stack.poll(0);
 
     // Pump until handshake
@@ -100,7 +104,7 @@ pub fn main() !void {
     pumpToServer(&link_b, &server_stack, &server, t);
 }
 
-fn pumpToServer(src: anytype, dst: *Stack, srv: *Stack.Server, now: u64) void {
+fn pumpToServer(src: anytype, dst: anytype, srv: anytype, now: u64) void {
     var buf: [1600]u8 = undefined;
     while (src.readOutbound(&buf)) |pkt| {
         const event = dst.injectPacket(now, pkt);
@@ -117,7 +121,7 @@ fn pumpToServer(src: anytype, dst: *Stack, srv: *Stack.Server, now: u64) void {
     _ = dst.poll(now);
 }
 
-fn pumpRaw(src: anytype, dst: *Stack, now: u64) void {
+fn pumpRaw(src: anytype, dst: anytype, now: u64) void {
     var buf: [1600]u8 = undefined;
     while (src.readOutbound(&buf)) |pkt| { _ = dst.injectPacket(now, pkt); }
     _ = dst.poll(now);

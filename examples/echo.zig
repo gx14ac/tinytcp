@@ -1,26 +1,24 @@
 // TCP echo server — demonstrates the high-level Server API.
 //
 // Two stacks (client + server) connected via virtual link.
-// Server uses Stack.Server for zero-boilerplate event dispatch.
+// Uses tinytcp.init() for the default stack (16 connections).
 
 const std = @import("std");
 const tinytcp = @import("tinytcp");
-
-const Stack = tinytcp.Stack(4);
 
 pub fn main() !void {
     var link_a = tinytcp.link.ChannelEndpoint.init();
     var link_b = tinytcp.link.ChannelEndpoint.init();
 
-    var server_stack = Stack.init(&link_a, .{ 10, 0, 0, 1 });
-    var client_stack = Stack.init(&link_b, .{ 10, 0, 0, 2 });
+    var server_stack = tinytcp.init(&link_a, .{ 10, 0, 0, 1 });
+    var client_stack = tinytcp.init(&link_b, .{ 10, 0, 0, 2 });
 
     // Server: listen
-    var server = Stack.Server.init(&server_stack);
+    var server = tinytcp.Server.init(&server_stack);
     if (!server.listen(80, 4)) return;
 
     // Client: connect
-    var stream = Stack.Stream.connect(&client_stack, 0, .{ 10, 0, 0, 1 }, 80) orelse return;
+    var stream = tinytcp.Stream.connect(&client_stack, 0, .{ 10, 0, 0, 1 }, 80) orelse return;
     _ = client_stack.poll(0);
 
     // Pump packets until handshake completes, then send data
@@ -42,7 +40,7 @@ pub fn main() !void {
     }
 }
 
-fn pumpToServer(src: *tinytcp.link.ChannelEndpoint, dst: *Stack, srv: *Stack.Server, now: u64) void {
+fn pumpToServer(src: *tinytcp.link.ChannelEndpoint, dst: anytype, srv: anytype, now: u64) void {
     var buf: [1600]u8 = undefined;
     while (src.readOutbound(&buf)) |pkt| {
         const event = dst.injectPacket(now, pkt);
@@ -51,7 +49,7 @@ fn pumpToServer(src: *tinytcp.link.ChannelEndpoint, dst: *Stack, srv: *Stack.Ser
     handleEvent(srv.handle(dst.poll(now)));
 }
 
-fn pumpRaw(src: *tinytcp.link.ChannelEndpoint, dst: *Stack, now: u64) void {
+fn pumpRaw(src: *tinytcp.link.ChannelEndpoint, dst: anytype, now: u64) void {
     var buf: [1600]u8 = undefined;
     while (src.readOutbound(&buf)) |pkt| {
         _ = dst.injectPacket(now, pkt);
@@ -59,7 +57,7 @@ fn pumpRaw(src: *tinytcp.link.ChannelEndpoint, dst: *Stack, now: u64) void {
     _ = dst.poll(now);
 }
 
-fn handleEvent(event: Stack.ServerEvent) void {
+fn handleEvent(event: tinytcp.ServerEvent) void {
     switch (event) {
         .accepted => {
             std.debug.print("server: accepted connection\n", .{});

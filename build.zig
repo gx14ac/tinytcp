@@ -58,11 +58,12 @@ pub fn build(b: *std.Build) void {
     const demo_step = b.step("demo", "Run the TCP stack demo");
     demo_step.dependOn(&run_demo.step);
 
-    // Minimal echo example
+    // Minimal echo example (ReleaseSafe: default stack is large for Debug)
+    const echo_optimize = if (optimize == .Debug) .ReleaseSafe else optimize;
     const echo_mod = b.createModule(.{
         .root_source_file = b.path("examples/echo.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = echo_optimize,
     });
     echo_mod.addImport("tinytcp", lib_mod);
     const echo_exe = b.addExecutable(.{

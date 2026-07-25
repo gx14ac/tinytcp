@@ -4,9 +4,26 @@
 
 // === Primary API ===
 
-pub const Stack = @import("full_stack.zig").FullStack;
+const full_stack_mod = @import("full_stack.zig");
+
+pub const Stack = full_stack_mod.FullStack;
+
+const DefaultStack = Stack(16);
+pub const Server = DefaultStack.Server;
+pub const ServerEvent = DefaultStack.ServerEvent;
+pub const Listener = DefaultStack.Listener;
+pub const Stream = DefaultStack.Stream;
+
+pub fn init(link_ep: *link.ChannelEndpoint, local_ip: [4]u8) DefaultStack {
+    return DefaultStack.init(link_ep, local_ip);
+}
+
+pub fn initWithSecret(link_ep: *link.ChannelEndpoint, local_ip: [4]u8, secret: [16]u8) DefaultStack {
+    return DefaultStack.initWithSecret(link_ep, local_ip, secret);
+}
+
 pub const tcp = @import("tcp.zig");
-pub const full_stack = @import("full_stack.zig");
+pub const full_stack = full_stack_mod;
 pub const config = @import("config.zig");
 pub const link = @import("link.zig");
 
