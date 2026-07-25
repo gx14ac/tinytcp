@@ -189,10 +189,6 @@ All buffer sizes are comptime parameters via `Config`:
 - [ ] Inbound TCP/UDP checksum verification (currently trusts lower layer integrity)
 - [ ] TLS record layer integration point
 
-## Related Projects
-
-- [runetale](https://github.com/runetale) — Mesh VPN using tinytcp as the userspace network stack
-
 ## License
 
 MIT
