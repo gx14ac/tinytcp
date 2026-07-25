@@ -1,0 +1,29 @@
+name: QEMU Network Interop Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  qemu-net-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm iputils-arping ethtool
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build embedded-net binary
+        run: zig build embedded-net
+
+      - name: Run QEMU + TAP interop test
+        run: sudo tests/embedded/run_net_interop.sh

@@ -1,0 +1,5 @@
+zig-out/
+!zig-out/bin/embedded-net
+zig-cache/
+.zig-cache/
+.git/

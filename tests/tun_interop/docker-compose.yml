@@ -1,0 +1,10 @@
+services:
+  tun-test:
+    build:
+      context: ../..
+      dockerfile: tests/tun_interop/Dockerfile
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    network_mode: "none"

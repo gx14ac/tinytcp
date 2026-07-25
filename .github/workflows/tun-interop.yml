@@ -1,0 +1,18 @@
+name: TUN Interop Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tun-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run TUN interop tests
+        run: |
+          cd tests/tun_interop
+          make docker-run

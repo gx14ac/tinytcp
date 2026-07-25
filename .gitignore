@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+test_io
+libtinytcp.a
+check_size
+test_asm
