@@ -86,6 +86,14 @@ pub const Timeouts = struct {
     pub const icmp: u64 = 30_000; // 30s
 };
 
+/// Per-flow traffic statistics.
+pub const ConnStats = struct {
+    packets_orig: u32 = 0,
+    packets_reply: u32 = 0,
+    bytes_orig: u64 = 0,
+    bytes_reply: u64 = 0,
+};
+
 /// A connection tracking entry.
 pub const ConnEntry = struct {
     active: bool = false,
@@ -97,6 +105,8 @@ pub const ConnEntry = struct {
     nat: NatInfo = .{},
     /// Number of packets seen.
     packet_count: u32 = 0,
+    /// Per-flow traffic counters.
+    stats: ConnStats = .{},
 
     pub fn protocol(self: *const ConnEntry) Protocol {
         return self.original.protocol;
@@ -137,11 +147,23 @@ pub const ConnTrack = struct {
     /// For existing connections, updates state and timestamp.
     /// Returns the entry index, or null if table is full.
     pub fn track(self: *ConnTrack, tuple: Tuple, now_ms: u64, is_reply: bool) ?usize {
+        return self.trackWithSize(tuple, now_ms, is_reply, 0);
+    }
+
+    /// Like track(), but also records packet byte count for stats.
+    pub fn trackWithSize(self: *ConnTrack, tuple: Tuple, now_ms: u64, is_reply: bool, pkt_size: u32) ?usize {
         // Check existing
         if (self.lookup(tuple)) |idx| {
             var entry = &self.entries[idx];
             entry.last_seen = now_ms;
             entry.packet_count += 1;
+            if (is_reply) {
+                entry.stats.packets_reply += 1;
+                entry.stats.bytes_reply += pkt_size;
+            } else {
+                entry.stats.packets_orig += 1;
+                entry.stats.bytes_orig += pkt_size;
+            }
 
             if (is_reply and entry.state == .new) {
                 entry.state = .established;
@@ -175,6 +197,10 @@ pub const ConnTrack = struct {
                         .icmp => Timeouts.icmp,
                     },
                     .packet_count = 1,
+                    .stats = .{
+                        .packets_orig = 1,
+                        .bytes_orig = pkt_size,
+                    },
                 };
                 self.entry_count += 1;
                 return i;
@@ -274,6 +300,24 @@ pub const ConnTrack = struct {
             return self.entries[idx].state;
         }
         return null;
+    }
+
+    /// Get per-flow traffic statistics.
+    pub fn getStats(self: *const ConnTrack, tuple: Tuple) ?ConnStats {
+        if (self.lookup(tuple)) |idx| {
+            return self.entries[idx].stats;
+        }
+        return null;
+    }
+
+    /// Get aggregate stats: total bytes across all active flows.
+    pub fn totalBytes(self: *const ConnTrack) u64 {
+        var total: u64 = 0;
+        for (&self.entries) |*entry| {
+            if (!entry.active) continue;
+            total += entry.stats.bytes_orig + entry.stats.bytes_reply;
+        }
+        return total;
     }
 };
 
@@ -589,4 +633,19 @@ test "conntrack: evaluate closing state allows traffic" {
     // CLOSING state should still allow (FIN-WAIT retransmissions)
     const verdict = ct.evaluate(tcp_tuple, 3000);
     try testing.expectEqual(Verdict.allow, verdict);
+}
+
+test "conntrack: stats tracking" {
+    var ct = ConnTrack.init();
+    _ = ct.trackWithSize(tcp_tuple, 1000, false, 100);
+    _ = ct.trackWithSize(tcp_tuple, 1100, false, 200);
+    _ = ct.trackWithSize(tcp_tuple.reverse(), 1200, true, 150);
+
+    const stats = ct.getStats(tcp_tuple).?;
+    try testing.expectEqual(@as(u32, 2), stats.packets_orig);
+    try testing.expectEqual(@as(u64, 300), stats.bytes_orig);
+    try testing.expectEqual(@as(u32, 1), stats.packets_reply);
+    try testing.expectEqual(@as(u64, 150), stats.bytes_reply);
+
+    try testing.expectEqual(@as(u64, 450), ct.totalBytes());
 }

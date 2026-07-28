@@ -24,6 +24,9 @@ const tcp_header = @import("header/tcp.zig");
 const ipv4_header = @import("header/ipv4.zig");
 const udp_header = @import("header/udp.zig");
 const udp_endpoint = @import("transport/udp/endpoint.zig");
+const conntrack_mod = @import("conntrack.zig");
+const forwarder_mod = @import("forward/forwarder.zig");
+const checksum_mod = @import("checksum.zig");
 
 const Connection = tcp_connection.Connection;
 const Segment = tcp_connection.Segment;
@@ -150,6 +153,12 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         ipv6_enabled: bool = false,
         // Current path MTU (default 1500, updated by ICMP errors)
         path_mtu: u16 = 1500,
+        // Forwarding / NAT
+        forwarding_enabled: bool = false,
+        conntrack: conntrack_mod.ConnTrack = conntrack_mod.ConnTrack.init(),
+        forwarder: forwarder_mod.Forwarder(256) = forwarder_mod.Forwarder(256).init(.{}),
+        // Egress link for forwarded packets (null = same as ingress link)
+        egress_link: ?*LinkT = null,
 
         pub fn init(link_ep: *LinkT, local_addr: [4]u8) Self {
             return Self{
@@ -220,6 +229,12 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             const dst_addr = ip_hdr.dstAddr();
             const ip_payload = ip_hdr.payload(raw);
 
+            // Forwarding: if dst is not our local address and forwarding is enabled
+            if (self.forwarding_enabled and !std.mem.eql(u8, &dst_addr, &self.local_addr)) {
+                self.forwardPacket(now_ms, raw, src_addr, dst_addr, ip_hdr, ip_payload, proto);
+                return .none;
+            }
+
             // ICMP handling
             if (proto == .icmp) {
                 self.handleIcmp(src_addr, dst_addr, ip_payload);
@@ -241,6 +256,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             if (ip_payload.len < 20) return .none;
             const tcp_hdr = tcp_header.Header.parse(ip_payload) catch return .none;
+            if (!tcp_hdr.verifyChecksumIpv4(src_addr, dst_addr, ip_payload)) return .none;
 
             const src_port = tcp_hdr.srcPort();
             const dst_port = tcp_hdr.dstPort();
@@ -349,6 +365,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             if (ip6_payload.len < 20) return .none;
 
             const tcp_hdr = tcp_header.Header.parse(ip6_payload) catch return .none;
+            if (!tcp_hdr.verifyChecksumIpv6(ip6_hdr.srcAddr(), ip6_hdr.dstAddr(), ip6_payload)) return .none;
             const flags = tcp_hdr.flags();
             const seg_seq = tcp_hdr.seqNum();
             const seg_ack = tcp_hdr.ackNum();
@@ -456,6 +473,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             if (payload.len < 20) return .none;
 
             const tcp_hdr = tcp_header.Header.parse(payload) catch return .none;
+            if (!tcp_hdr.verifyChecksumIpv6(src6, dst6, payload)) return .none;
             const flags = tcp_hdr.flags();
             const seg_seq = tcp_hdr.seqNum();
             const seg_ack = tcp_hdr.ackNum();
@@ -1663,6 +1681,165 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         fn nextIsn(self: *Self, now_ms: u64, id: ConnId) u32 {
             return self.isn_gen.generate(now_ms, id.local_addr, id.local_port, id.remote_addr, id.remote_port);
         }
+
+        // ================================================================
+        // Forwarding / NAT
+        // ================================================================
+
+        /// Enable IP forwarding with optional NAT configuration.
+        pub fn enableForwarding(self: *Self, config: forwarder_mod.Config) void {
+            self.forwarding_enabled = true;
+            self.forwarder = forwarder_mod.Forwarder(256).init(config);
+        }
+
+        /// Disable IP forwarding.
+        pub fn disableForwarding(self: *Self) void {
+            self.forwarding_enabled = false;
+        }
+
+        /// Set the egress link endpoint for forwarded packets.
+        pub fn setEgressLink(self: *Self, link_ep: *LinkT) void {
+            self.egress_link = link_ep;
+        }
+
+        /// Expire idle conntrack/forwarder entries. Call periodically.
+        pub fn expireFlows(self: *Self, now_ms: u64) usize {
+            const ct_expired = self.conntrack.expire(now_ms);
+            const fwd_expired = self.forwarder.tick(now_ms);
+            return ct_expired + fwd_expired;
+        }
+
+        /// Get the number of active tracked flows.
+        pub fn activeFlows(self: *const Self) usize {
+            return self.conntrack.entry_count;
+        }
+
+        /// Get per-flow stats for a given tuple.
+        pub fn flowStats(self: *const Self, src_addr: [4]u8, src_port: u16, dst_addr: [4]u8, dst_port: u16, proto: conntrack_mod.Protocol) ?conntrack_mod.ConnStats {
+            const tuple = conntrack_mod.Tuple{
+                .src_addr = src_addr,
+                .dst_addr = dst_addr,
+                .src_port = src_port,
+                .dst_port = dst_port,
+                .protocol = proto,
+            };
+            return self.conntrack.getStats(tuple);
+        }
+
+        /// Total bytes forwarded across all tracked flows.
+        pub fn totalForwardedBytes(self: *const Self) u64 {
+            return self.conntrack.totalBytes();
+        }
+
+        fn forwardPacket(self: *Self, now_ms: u64, raw: []const u8, src_addr: [4]u8, dst_addr: [4]u8, ip_hdr: ipv4_header.Header, ip_payload: []const u8, proto: ipv4_header.Protocol) void {
+            _ = ip_hdr;
+            const ttl = raw[8];
+
+            // Extract ports for TCP/UDP
+            var src_port: u16 = 0;
+            var dst_port: u16 = 0;
+            if ((proto == .tcp or proto == .udp) and ip_payload.len >= 4) {
+                src_port = std.mem.readInt(u16, ip_payload[0..2], .big);
+                dst_port = std.mem.readInt(u16, ip_payload[2..4], .big);
+            }
+
+            const proto_u8: u8 = switch (proto) {
+                .tcp => 6,
+                .udp => 17,
+                .icmp => 1,
+                else => return,
+            };
+
+            // Forwarder decision
+            const decision = self.forwarder.decideInbound(now_ms, src_addr, src_port, dst_addr, dst_port, proto_u8, ttl);
+            switch (decision) {
+                .drop => return,
+                .local => {
+                    // Should not happen since we already checked dst != local_addr, but handle gracefully
+                    return;
+                },
+                .icmp_unreachable => return,
+                .forward => |info| {
+                    // Track connection with byte stats
+                    const ct_tuple = conntrack_mod.Tuple{
+                        .src_addr = src_addr,
+                        .dst_addr = dst_addr,
+                        .src_port = src_port,
+                        .dst_port = dst_port,
+                        .protocol = if (proto == .tcp) .tcp else if (proto == .udp) .udp else .icmp,
+                    };
+                    _ = self.conntrack.trackWithSize(ct_tuple, now_ms, false, @intCast(raw.len));
+
+                    // Build forwarded packet with NAT rewrites
+                    var fwd_buf: [1600]u8 = undefined;
+                    if (raw.len > fwd_buf.len) return;
+                    @memcpy(fwd_buf[0..raw.len], raw);
+
+                    // TTL decrement
+                    if (info.decrement_ttl) {
+                        if (fwd_buf[8] <= 1) return;
+                        fwd_buf[8] -= 1;
+                    }
+
+                    // NAT rewrites
+                    if (info.new_src_addr) |addr| {
+                        @memcpy(fwd_buf[12..16], &addr);
+                    }
+                    if (info.new_dst_addr) |addr| {
+                        @memcpy(fwd_buf[16..20], &addr);
+                    }
+
+                    // Port rewrites (TCP/UDP)
+                    if ((proto == .tcp or proto == .udp) and ip_payload.len >= 4) {
+                        const ihl: usize = @as(usize, fwd_buf[0] & 0x0F) * 4;
+                        if (info.new_src_port) |port| {
+                            std.mem.writeInt(u16, fwd_buf[ihl..][0..2], port, .big);
+                        }
+                        if (info.new_dst_port) |port| {
+                            std.mem.writeInt(u16, fwd_buf[ihl + 2 ..][0..2], port, .big);
+                        }
+                    }
+
+                    // Recompute IP header checksum
+                    const ihl_final: usize = @as(usize, fwd_buf[0] & 0x0F) * 4;
+                    fwd_buf[10] = 0;
+                    fwd_buf[11] = 0;
+                    const ip_cksum = checksum_mod.compute(fwd_buf[0..ihl_final]);
+                    std.mem.writeInt(u16, fwd_buf[10..12], ip_cksum, .big);
+
+                    // Recompute transport checksum for NAT'd packets
+                    if (info.new_src_addr != null or info.new_dst_addr != null or
+                        info.new_src_port != null or info.new_dst_port != null)
+                    {
+                        const total_len: usize = @as(usize, std.mem.readInt(u16, fwd_buf[2..4], .big));
+                        if (total_len > ihl_final) {
+                            const transport_slice = fwd_buf[ihl_final..total_len];
+                            if (proto == .tcp and transport_slice.len >= 20) {
+                                // Clear TCP checksum and recompute
+                                transport_slice[16] = 0;
+                                transport_slice[17] = 0;
+                                const ph = checksum_mod.pseudoHeaderIpv4(fwd_buf[12..16].*, fwd_buf[16..20].*, 6, @intCast(transport_slice.len));
+                                const sum = checksum_mod.accumulate(ph, transport_slice);
+                                const tcp_cksum = checksum_mod.finish(sum);
+                                std.mem.writeInt(u16, transport_slice[16..18], tcp_cksum, .big);
+                            } else if (proto == .udp and transport_slice.len >= 8) {
+                                // Clear UDP checksum and recompute
+                                transport_slice[6] = 0;
+                                transport_slice[7] = 0;
+                                const ph = checksum_mod.pseudoHeaderIpv4(fwd_buf[12..16].*, fwd_buf[16..20].*, 17, @intCast(transport_slice.len));
+                                const sum = checksum_mod.accumulate(ph, transport_slice);
+                                const udp_cksum = checksum_mod.finish(sum);
+                                std.mem.writeInt(u16, transport_slice[6..8], udp_cksum, .big);
+                            }
+                        }
+                    }
+
+                    // Send to egress link (outbound = toward the wire)
+                    const egress = self.egress_link orelse self.link;
+                    egress.writeOutbound(fwd_buf[0..raw.len]);
+                },
+            }
+        }
     };
 }
 
@@ -2730,4 +2907,126 @@ test "FullStack: hash index lookup (max_conns > 32)" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "FullStack: TCP with corrupted checksum is dropped" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listen(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(
+        .{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80,
+        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+    );
+
+    // Corrupt TCP checksum (bytes 36-37 in a standard 20-byte IP + 20-byte TCP header)
+    pkt_buf[36] ^= 0xFF;
+
+    const event = stack.injectPacket(0, pkt_buf[0..syn_len]);
+    switch (event) {
+        .none => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // No SYN-ACK should be generated
+    var out_buf: [1600]u8 = undefined;
+    try testing.expect(link_ep.readOutbound(&out_buf) == null);
+}
+
+test "FullStack: forwarding with SNAT" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var egress_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 100, 64, 0, 1 });
+
+    stack.enableForwarding(.{
+        .local_addr = .{ 100, 64, 0, 1 },
+        .mesh_prefix = .{ 100, 64, 0, 0 },
+        .mesh_prefix_len = 10,
+        .exit_node = true,
+        .nat_port_start = 40000,
+        .nat_port_end = 50000,
+    });
+    stack.setEgressLink(&egress_ep);
+
+    // Inject a packet from mesh peer destined for the internet (needs SNAT)
+    var pkt_buf: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(
+        .{ 100, 64, 0, 2 }, 5000, .{ 8, 8, 8, 8 }, 443,
+        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+    );
+    const event = stack.injectPacket(100, pkt_buf[0..syn_len]);
+    try testing.expectEqual(Event.none, event);
+
+    // Check that the packet was forwarded to egress with NAT applied
+    var fwd_buf: [1600]u8 = undefined;
+    const fwd_pkt = egress_ep.readOutbound(&fwd_buf);
+    try testing.expect(fwd_pkt != null);
+
+    if (fwd_pkt) |pkt| {
+        // Source IP should be rewritten to our local addr
+        try testing.expect(std.mem.eql(u8, pkt[12..16], &[4]u8{ 100, 64, 0, 1 }));
+        // Destination should remain 8.8.8.8
+        try testing.expect(std.mem.eql(u8, pkt[16..20], &[4]u8{ 8, 8, 8, 8 }));
+        // TTL should be decremented
+        try testing.expectEqual(@as(u8, 63), pkt[8]);
+        // Source port should be NAT'd to 40000
+        const ihl: usize = @as(usize, pkt[0] & 0x0F) * 4;
+        const nat_port = std.mem.readInt(u16, pkt[ihl..][0..2], .big);
+        try testing.expectEqual(@as(u16, 40000), nat_port);
+    }
+
+    // Verify conntrack entry was created
+    try testing.expectEqual(@as(usize, 1), stack.activeFlows());
+}
+
+test "FullStack: forwarding mesh-to-mesh (no NAT)" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var egress_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 100, 64, 0, 1 });
+
+    stack.enableForwarding(.{
+        .local_addr = .{ 100, 64, 0, 1 },
+        .mesh_prefix = .{ 100, 64, 0, 0 },
+        .mesh_prefix_len = 10,
+    });
+    stack.setEgressLink(&egress_ep);
+
+    // Mesh peer A (100.64.0.2) → Mesh peer B (100.64.0.3), forwarded via us
+    var pkt_buf: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(
+        .{ 100, 64, 0, 2 }, 5000, .{ 100, 64, 0, 3 }, 80,
+        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+    );
+    _ = stack.injectPacket(100, pkt_buf[0..syn_len]);
+
+    var fwd_buf: [1600]u8 = undefined;
+    const fwd_pkt = egress_ep.readOutbound(&fwd_buf);
+    try testing.expect(fwd_pkt != null);
+
+    if (fwd_pkt) |pkt| {
+        // No NAT: source and dest unchanged
+        try testing.expect(std.mem.eql(u8, pkt[12..16], &[4]u8{ 100, 64, 0, 2 }));
+        try testing.expect(std.mem.eql(u8, pkt[16..20], &[4]u8{ 100, 64, 0, 3 }));
+        // TTL decremented
+        try testing.expectEqual(@as(u8, 63), pkt[8]);
+    }
+}
+
+test "FullStack: forwarding disabled does not forward" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 100, 64, 0, 1 });
+
+    // Forwarding NOT enabled — packet to another IP should be silently dropped
+    var pkt_buf: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(
+        .{ 100, 64, 0, 2 }, 5000, .{ 100, 64, 0, 3 }, 80,
+        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+    );
+    const event = stack.injectPacket(100, pkt_buf[0..syn_len]);
+    try testing.expectEqual(Event.none, event);
+
+    // Nothing forwarded (no egress link set, but also no forwarding)
+    var fwd_buf: [1600]u8 = undefined;
+    try testing.expect(link_ep.readOutbound(&fwd_buf) == null);
 }

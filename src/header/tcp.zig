@@ -122,6 +122,13 @@ pub const Header = struct {
         const sum = checksum.accumulate(ph, full_segment);
         return checksum.finish(sum) == 0;
     }
+
+    /// Verify checksum against pseudo-header (IPv6).
+    pub fn verifyChecksumIpv6(_: Header, src: [16]u8, dst: [16]u8, full_segment: []const u8) bool {
+        const ph = checksum.pseudoHeaderIpv6(src, dst, 6, @intCast(full_segment.len));
+        const sum = checksum.accumulate(ph, full_segment);
+        return checksum.finish(sum) == 0;
+    }
 };
 
 /// TCP options iterator.
