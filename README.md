@@ -1,8 +1,6 @@
 # tinytcp
 
-Sans-IO userspace TCP/IP stack in Zig. Zero-allocation data path, comptime generics, no libc dependency.
-
-Designed for TCP proxies, WASM runtimes, bare-metal firmware, and anywhere you need a full TCP/IP stack without OS sockets.
+tinytcp is a small independent implementation of the TCP/IP protocol suite in Zig. The focus is to eliminate runtime allocation while providing a full-scale TCP/IP stack. This makes tinytcp suitable for use in embedded systems, WASM runtimes, TCP proxies, and network appliance emulation where OS sockets are unavailable or undesirable.
 
 ## Features
 
