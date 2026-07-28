@@ -58,8 +58,9 @@ pub fn build(b: *std.Build) void {
     const demo_step = b.step("demo", "Run the TCP stack demo");
     demo_step.dependOn(&run_demo.step);
 
-    // Minimal echo example (ReleaseSafe: default stack is large for Debug)
-    const echo_optimize = if (optimize == .Debug) .ReleaseSafe else optimize;
+    // Examples use ReleaseSmall: FullStack structs are large and can
+    // overflow the default thread stack in Debug/ReleaseSafe modes.
+    const echo_optimize = if (optimize == .Debug or optimize == .ReleaseSafe) .ReleaseSmall else optimize;
     const echo_mod = b.createModule(.{
         .root_source_file = b.path("examples/echo.zig"),
         .target = target,
@@ -74,6 +75,54 @@ pub fn build(b: *std.Build) void {
     const run_echo = b.addRunArtifact(echo_exe);
     const echo_step = b.step("echo", "Run minimal TCP echo example");
     echo_step.dependOn(&run_echo.step);
+
+    // Embedded example (minimal RAM footprint)
+    const embedded_example_mod = b.createModule(.{
+        .root_source_file = b.path("examples/embedded.zig"),
+        .target = target,
+        .optimize = echo_optimize,
+    });
+    embedded_example_mod.addImport("tinytcp", lib_mod);
+    const embedded_example_exe = b.addExecutable(.{
+        .name = "embedded-example",
+        .root_module = embedded_example_mod,
+    });
+    b.installArtifact(embedded_example_exe);
+    const run_embedded_example = b.addRunArtifact(embedded_example_exe);
+    const embedded_example_step = b.step("embedded-example", "Run embedded TCP example (minimal RAM)");
+    embedded_example_step.dependOn(&run_embedded_example.step);
+
+    // Packet filter example (network appliance emulation)
+    const filter_mod = b.createModule(.{
+        .root_source_file = b.path("examples/packet_filter.zig"),
+        .target = target,
+        .optimize = echo_optimize,
+    });
+    filter_mod.addImport("tinytcp", lib_mod);
+    const filter_exe = b.addExecutable(.{
+        .name = "packet-filter",
+        .root_module = filter_mod,
+    });
+    b.installArtifact(filter_exe);
+    const run_filter = b.addRunArtifact(filter_exe);
+    const filter_step = b.step("packet-filter", "Run packet filter example (firewall/IDS)");
+    filter_step.dependOn(&run_filter.step);
+
+    // Time-travel testing example (protocol conformance)
+    const time_travel_mod = b.createModule(.{
+        .root_source_file = b.path("examples/time_travel.zig"),
+        .target = target,
+        .optimize = echo_optimize,
+    });
+    time_travel_mod.addImport("tinytcp", lib_mod);
+    const time_travel_exe = b.addExecutable(.{
+        .name = "time-travel",
+        .root_module = time_travel_mod,
+    });
+    b.installArtifact(time_travel_exe);
+    const run_time_travel = b.addRunArtifact(time_travel_exe);
+    const time_travel_step = b.step("time-travel", "Run time-travel testing example (deterministic replay)");
+    time_travel_step.dependOn(&run_time_travel.step);
 
     // TUN echo server (macOS utun interop test)
     const tun_mod = b.createModule(.{

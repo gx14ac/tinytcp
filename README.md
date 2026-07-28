@@ -59,9 +59,13 @@ var server = Stack.Server.init(&stack);
 Requires Zig 0.15.x.
 
 ```sh
-zig build          # build library
-zig build test     # run unit tests
-zig build echo     # run minimal example
+zig build                # build library
+zig build test           # run unit tests
+zig build echo           # TCP echo (Server API)
+zig build embedded-example   # minimal RAM footprint demo
+zig build packet-filter  # firewall / middlebox emulation
+zig build time-travel    # deterministic protocol testing
+zig build tun-echo       # real TUN device (macOS, requires sudo)
 ```
 
 ## Example
@@ -155,6 +159,18 @@ Sans-IO design: no sockets, no threads, no allocator. The caller drives time (`n
 | `Stack.Server` | Event-driven | Real applications with event loops |
 | `Stack.Listener` / `Stack.Stream` | Scripted | Simple programs, tests |
 | `Stack` raw methods | Direct | Maximum control, custom event handling |
+
+## Use Cases
+
+**VPN / Overlay Networks** — Embed a full TCP/IP stack inside WireGuard or custom tunnels. Sans-IO design fits naturally into VPN event loops without threading or callbacks.
+
+**Network Appliance Emulation** — Build virtual firewalls, NAT gateways, load balancers, or IDS systems. Inspect and filter packets between stacks with zero overhead. See `examples/packet_filter.zig`.
+
+**Protocol Testing & Fuzzing** — Time is a parameter, not a wall clock. Freeze time, inject crafted packets, verify exact state transitions, reproduce race conditions deterministically. See `examples/time_travel.zig`.
+
+**Embedded / Bare-metal** — Runs on Cortex-M3 with ~4KB RAM per connection. No allocator, no libc, no OS. Comptime generics let you tune buffer sizes for your target. See `examples/embedded.zig`.
+
+**WASM Runtimes** — No syscalls, no libc, no threads. Compile to WASM and drive the stack from JavaScript or any host runtime.
 
 ## Embedded
 

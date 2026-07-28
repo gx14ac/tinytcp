@@ -554,13 +554,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     .closed => {
                         self.hashRemove(idx);
                         slot.active = false;
-                        self.active_count -= 1;
+                        if (self.active_count > 0) self.active_count -= 1;
                         return .{ .closed = @intCast(idx) };
                     },
                     .aborted => {
                         self.hashRemove(idx);
                         slot.active = false;
-                        self.active_count -= 1;
+                        if (self.active_count > 0) self.active_count -= 1;
                         return .{ .aborted = @intCast(idx) };
                     },
                     else => {},
@@ -1475,7 +1475,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                             self.buildAndSend(self.conns[idx].id, .{ .rst = true, .ack = true }, self.conns[idx].conn.sender.snd_nxt, self.conns[idx].conn.receiver.rcv_nxt, 0, &.{});
                             self.hashRemove(idx);
                             self.conns[idx].active = false;
-                            self.active_count -= 1;
+                            self.active_count -|= 1;
                             return .none;
                         }
                         return .{ .accepted = conn_idx };
@@ -1488,14 +1488,14 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     if (self.conns[idx].conn.state == .syn_received) self.syn_queue_count -|= 1;
                     self.hashRemove(idx);
                     self.conns[idx].active = false;
-                    self.active_count -= 1;
+                    self.active_count -|= 1;
                     return .{ .closed = @intCast(idx) };
                 },
                 .aborted => {
                     if (self.conns[idx].conn.state == .syn_received) self.syn_queue_count -|= 1;
                     self.hashRemove(idx);
                     self.conns[idx].active = false;
-                    self.active_count -= 1;
+                    self.active_count -|= 1;
                     return .{ .aborted = @intCast(idx) };
                 },
                 .none => {},
