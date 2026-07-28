@@ -196,12 +196,17 @@ All buffer sizes are comptime parameters via `Config`:
 
 ## Roadmap
 
-- [ ] Per-destination Path MTU Discovery cache + aging
-- [ ] NAT module (masquerade, port pool, incremental checksum update)
-- [ ] mDNS / DNS-SD (multicast DNS for local service discovery)
-- [ ] DHCP server mode (for gateway / AP use cases)
-- [ ] Inbound TCP/UDP checksum verification (currently trusts lower layer integrity)
-- [ ] TLS record layer integration point
+**Correctness & Security**
+- [ ] Inbound TCP/UDP checksum verification ([#58](https://github.com/gx14ac/tinytcp/issues/58))
+- [ ] Per-destination Path MTU Discovery cache + aging ([#48](https://github.com/gx14ac/tinytcp/issues/48))
+
+**Networking Features**
+- [ ] NAT module — masquerade, port pool, incremental checksum ([#49](https://github.com/gx14ac/tinytcp/issues/49))
+- [ ] mDNS / DNS-SD — multicast DNS for local service discovery ([#55](https://github.com/gx14ac/tinytcp/issues/55))
+- [ ] DHCP server mode — for gateway / AP use cases ([#56](https://github.com/gx14ac/tinytcp/issues/56))
+
+**Integration**
+- [ ] TLS record layer integration point ([#59](https://github.com/gx14ac/tinytcp/issues/59))
 
 ## License
 
