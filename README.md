@@ -2,7 +2,7 @@
 
 Sans-IO userspace TCP/IP stack in Zig. Zero-allocation data path, comptime generics, no libc dependency.
 
-Designed for WASM runtimes, bare-metal firmware, and anywhere you need a full TCP/IP stack without OS sockets.
+Designed for TCP proxies, WASM runtimes, bare-metal firmware, and anywhere you need a full TCP/IP stack without OS sockets.
 
 ## Features
 
