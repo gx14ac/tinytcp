@@ -554,13 +554,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     .closed => {
                         self.hashRemove(idx);
                         slot.active = false;
-                        if (self.active_count > 0) self.active_count -= 1;
+                        self.active_count -|= 1;
                         return .{ .closed = @intCast(idx) };
                     },
                     .aborted => {
                         self.hashRemove(idx);
                         slot.active = false;
-                        if (self.active_count > 0) self.active_count -= 1;
+                        self.active_count -|= 1;
                         return .{ .aborted = @intCast(idx) };
                     },
                     else => {},

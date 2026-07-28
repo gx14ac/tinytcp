@@ -92,7 +92,8 @@ pub fn main() !void {
         pumpFiltered(&link_server, &client_stack, t, &allowed, &dropped);
     }
 
-    std.debug.print("port 80 connection: {s}\n", .{if (conn80 != null) "established" else "failed"});
+    const established = if (conn80) |idx| client_stack.connState(idx) != null else false;
+    std.debug.print("port 80 connection: {s}\n", .{if (established) "established" else "failed"});
 
     // Client tries port 22 (blocked)
     _ = client_stack.connect(t, .{ 10, 0, 0, 1 }, 22, 5001);

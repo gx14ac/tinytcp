@@ -24,7 +24,8 @@ pub fn main() !void {
     std.debug.print("  MSS:       {d}\n", .{Config.embedded_minimal.default_mss});
     std.debug.print("  RAM/conn:  ~{d} bytes\n", .{Config.embedded_minimal.perConnBytes()});
     std.debug.print("  max_conns: 2\n", .{});
-    std.debug.print("  Stack size: {d} bytes\n\n", .{@sizeOf(Stack)});
+    std.debug.print("  Stack size: {d} bytes (includes hash table + alignment padding)\n", .{@sizeOf(Stack)});
+    std.debug.print("  Effective data per conn: ~{d} bytes\n\n", .{Config.embedded_minimal.perConnBytes()});
 
     // Two embedded stacks talking to each other
     var link_a = SmallLink.init();
