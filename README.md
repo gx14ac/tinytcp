@@ -30,16 +30,19 @@ _ = server.listen(80, 8);
 
 // Event loop
 while (true) {
-    switch (server.injectPacket(now_ms, pkt)) {
-        .accepted => |stream| _ = stream,
+    handleEvent(server.injectPacket(now_ms, pkt));
+    handleEvent(server.poll(now_ms));
+}
+
+fn handleEvent(event: tinytcp.ServerEvent) void {
+    switch (event) {
         .data => |stream| {
             var buf: [4096]u8 = undefined;
             const n = stream.recv(&buf);
             _ = stream.send(buf[0..n]); // echo
         },
-        .closed, .aborted, .none => {},
+        .accepted, .closed, .aborted, .none => {},
     }
-    _ = server.poll(now_ms);
 }
 ```
 
