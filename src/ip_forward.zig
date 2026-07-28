@@ -179,7 +179,7 @@ pub const IpForwarder = struct {
         };
     }
 
-    /// Decrement TTL and recompute IPv4 header checksum (in-place).
+    /// Decrement TTL and incrementally update IPv4 header checksum (RFC 1141).
     /// `header` must be a mutable slice of at least 20 bytes (IPv4 header).
     /// Returns false if TTL would reach 0.
     pub fn decrementTtl(header: []u8) bool {
@@ -188,22 +188,17 @@ pub const IpForwarder = struct {
         if (ttl <= 1) return false;
         header[8] = ttl - 1;
 
-        // Full recompute of IPv4 header checksum.
-        header[10] = 0;
-        header[11] = 0;
-        const ihl: usize = @as(usize, header[0] & 0x0F) * 4;
-        const hdr_len = @min(ihl, header.len);
-        var cksum: u32 = 0;
-        var i: usize = 0;
-        while (i + 1 < hdr_len) : (i += 2) {
-            cksum += @as(u32, header[i]) << 8 | @as(u32, header[i + 1]);
-        }
-        while (cksum >> 16 != 0) {
-            cksum = (cksum & 0xffff) + (cksum >> 16);
-        }
-        const result = ~@as(u16, @intCast(cksum & 0xffff));
-        header[10] = @intCast(result >> 8);
-        header[11] = @intCast(result & 0xff);
+        // Incremental checksum update: only TTL byte changed (RFC 1141).
+        // The 16-bit word at offset 8 is [TTL, Protocol].
+        // old_word = (old_ttl << 8) | protocol
+        // new_word = (new_ttl << 8) | protocol
+        // Difference is exactly 0x0100 (one TTL unit in the high byte).
+        var cksum: u32 = @as(u32, header[10]) << 8 | @as(u32, header[11]);
+        cksum += 0x0100;
+        cksum += cksum >> 16;
+        cksum &= 0xFFFF;
+        header[10] = @intCast(cksum >> 8);
+        header[11] = @intCast(cksum & 0xFF);
         return true;
     }
 
