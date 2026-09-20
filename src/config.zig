@@ -35,6 +35,15 @@ pub const Config = struct {
     /// Maximum reassembled datagram size (IPv4 fragment reassembly buffer per slot).
     max_reasm_datagram: usize = 8192,
 
+    /// Ports the stack can listen on at once. A listen holds its slot until
+    /// unlisten gives it back, so a caller that opens a listener per
+    /// destination port needs room for every port it will serve at once.
+    max_listen_ports: usize = 8,
+
+    /// UDP endpoints open at once. Unlike listen ports these come back on
+    /// their own, when the endpoint is closed.
+    max_udp_endpoints: usize = 16,
+
     /// Minimal embedded profile: ~4KB per connection.
     pub const embedded_minimal = Config{
         .send_buf_size = 1024,

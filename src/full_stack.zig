@@ -89,19 +89,25 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             conn: ConnectionT = .{},
             id: ConnId = undefined,
             active: bool = false,
+            /// Opened by a SYN we answered, rather than by connect(). Set
+            /// when the slot is taken and read when the handshake finishes:
+            /// asking "is this port listening?" at that point gets it wrong
+            /// both ways, since a listener can go away mid-handshake and an
+            /// active open can use a port the stack also listens on.
+            passive: bool = false,
             is_v6: bool = false,
             local_addr6: [16]u8 = .{0} ** 16,
             remote_addr6: [16]u8 = .{0} ** 16,
         };
 
-        const max_udp_endpoints: usize = 16;
+        const max_udp_endpoints: usize = cfg.max_udp_endpoints;
 
         pub const UdpSlot = struct {
             ep: udp_endpoint.Endpoint = .{},
             active: bool = false,
         };
 
-        const max_listen_ports: usize = 8;
+        const max_listen_ports: usize = cfg.max_listen_ports;
         const ReasmT = reassembly_mod.ReassemblerWith(8, cfg.max_reasm_datagram);
         const use_hash_index = max_conns > 32;
         const hash_capacity = if (use_hash_index) max_conns * 2 else 0;
@@ -651,6 +657,35 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             self.syn_queue_limit = @max(self.syn_queue_limit, limit);
             self.accept_queue_limit = @max(self.accept_queue_limit, limit);
             return true;
+        }
+
+        /// Stop listening on a port and give its slot back. Returns false if
+        /// the port was not in the listen set.
+        ///
+        /// Established connections on that port are left alone, as closing a
+        /// listening socket does everywhere else: what stops is new SYNs,
+        /// which from here on are dropped as they are for any closed port. A
+        /// handshake still in flight finishes and is then reset, since there
+        /// is no longer anyone to accept it.
+        ///
+        /// The SYN and accept queue limits keep whatever a listen raised them
+        /// to; they bound queues that are shared across ports.
+        pub fn unlisten(self: *Self, port: u16) bool {
+            for (self.listen_ports[0..self.listen_count], 0..) |p, i| {
+                if (p != port) continue;
+                self.listen_count -= 1;
+                // The set has no order, so the last entry fills the hole.
+                self.listen_ports[i] = self.listen_ports[self.listen_count];
+                self.listen_ports[self.listen_count] = 0;
+                return true;
+            }
+            return false;
+        }
+
+        /// How many listen slots are still free, so a caller can tell a full
+        /// set from a refused port.
+        pub fn listenSlotsFree(self: *const Self) usize {
+            return max_listen_ports -| self.listen_count;
         }
 
         /// Check if a port is in the listen set.
@@ -1376,6 +1411,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             const slot = &self.conns[idx];
             slot.id = id;
             slot.active = true;
+            slot.passive = true;
             slot.conn = ConnectionT.acceptFromSyn(id.local_port, isn, now_ms, peer_opts);
 
             // Process the SYN — produces SYN+ACK output
@@ -1411,6 +1447,14 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         /// Accept a connection validated by SYN cookie (reconstruct state from ACK).
         fn acceptCookieConn(self: *Self, now_ms: u64, id: ConnId, seg_seq: u32, seg_ack: u32, seg_wnd: u16, cookie_mss: u16, payload: []const u8) Event {
+            // The cookie was minted while the port was listening, and the
+            // listener can be gone by the time the ACK carrying it arrives.
+            // The peer believes it has a connection, so say otherwise.
+            if (!self.isListening(id.local_port)) {
+                self.sendRst(id.local_addr, id.local_port, id.remote_addr, id.remote_port, seg_ack, seg_seq);
+                return .none;
+            }
+
             // Drop if accept queue is full
             if (self.accept_queue_count >= self.accept_queue_limit) return .none;
 
@@ -1420,6 +1464,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             const slot = &self.conns[idx];
             slot.id = id;
             slot.active = true;
+            slot.passive = true;
             slot.conn = .{
                 .state = .established,
                 .local_port = id.local_port,
@@ -1485,11 +1530,17 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 },
                 .established => {
                     const conn_idx: u16 = @intCast(idx);
-                    // Server-side (passive open): enqueue to accept queue
-                    if (self.isListening(self.conns[idx].id.local_port)) {
+                    // Server-side (passive open): enqueue to accept queue.
+                    // Which side opened it is recorded on the slot: the listen
+                    // set answers a different question, and unlisten during a
+                    // handshake used to leave the half-open count and the slot
+                    // itself behind, with no way to reach the connection.
+                    if (self.conns[idx].passive) {
                         self.syn_queue_count -|= 1;
-                        if (!self.enqueueAccept(conn_idx)) {
-                            // Accept queue full: send RST and free the slot
+                        // No listener left to hand it to, or nowhere to queue
+                        // it: an established connection nobody can accept is a
+                        // slot nobody frees, so end it here.
+                        if (!self.isListening(self.conns[idx].id.local_port) or !self.enqueueAccept(conn_idx)) {
                             self.buildAndSend(self.conns[idx].id, .{ .rst = true, .ack = true }, self.conns[idx].conn.sender.snd_nxt, self.conns[idx].conn.receiver.rcv_nxt, 0, &.{});
                             self.hashRemove(idx);
                             self.conns[idx].active = false;
@@ -2386,6 +2437,134 @@ test "FullStack: PMTU discovery updates MSS" {
     try testing.expectEqual(@as(u16, 1240), stack.conns[0].conn.mss); // 1280 - 40
     try testing.expectEqual(@as(u16, 1240), stack.conns[0].conn.sender.mss);
     try testing.expectEqual(@as(u16, 1280), stack.path_mtu);
+}
+
+test "FullStack: a listen can be given back, and the slots are finite" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+
+    // Eight is the default, and the ninth port has nowhere to go.
+    var port: u16 = 8000;
+    while (port < 8008) : (port += 1) try testing.expect(stack.listen(port, 128));
+    try testing.expectEqual(@as(usize, 0), stack.listenSlotsFree());
+    try testing.expect(!stack.listen(9999, 128));
+
+    // A port already in the set costs nothing and stays.
+    try testing.expect(stack.listen(8000, 128));
+    try testing.expectEqual(@as(usize, 0), stack.listenSlotsFree());
+
+    // Giving one back makes room, and only for a port that was there.
+    try testing.expect(stack.unlisten(8003));
+    try testing.expect(!stack.unlisten(8003));
+    try testing.expectEqual(@as(usize, 1), stack.listenSlotsFree());
+    try testing.expect(stack.listen(9999, 128));
+
+    // The set still holds the ports it did not give back, including the one
+    // the swap-remove moved.
+    port = 8000;
+    while (port < 8008) : (port += 1) {
+        const want = port != 8003;
+        try testing.expectEqual(want, stack.isListening(port));
+    }
+    try testing.expect(stack.isListening(9999));
+}
+
+test "FullStack: the listen and UDP capacities come from the config" {
+    const Small = FullStackWith(8, .{ .max_listen_ports = 2, .max_udp_endpoints = 1 });
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = Small.init(&link_ep, .{ 10, 0, 0, 1 });
+
+    try testing.expectEqual(@as(usize, 2), stack.listenSlotsFree());
+    try testing.expect(stack.listen(80, 128));
+    try testing.expect(stack.listen(81, 128));
+    try testing.expect(!stack.listen(82, 128));
+    try testing.expect(stack.unlisten(81));
+    try testing.expect(stack.listen(82, 128));
+
+    // And the UDP table is the size the config asked for, not the default 16.
+    try testing.expectEqual(@as(usize, 1), stack.udp_eps.len);
+    try testing.expect(stack.udpBind(53) != null);
+    try testing.expect(stack.udpBind(54) == null);
+}
+
+test "FullStack: unlisten stops new SYNs and leaves established connections alone" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listen(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // A connection reaches ESTABLISHED the usual way.
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(1, pkt_buf[0..ack_len]);
+    const conn_idx = stack.accept() orelse return error.NoConnection;
+
+    // The listener goes away.
+    try testing.expect(stack.unlisten(80));
+
+    // The established connection still carries data.
+    const data_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .ack = true, .psh = true }, 65535, "hi", &pkt_buf);
+    _ = stack.injectPacket(2, pkt_buf[0..data_len]);
+    var data: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), stack.read(conn_idx, &data));
+    try testing.expectEqualStrings("hi", data[0..2]);
+
+    // A new SYN on that port is dropped, as it is for any closed port: no
+    // SYN+ACK, and no connection.
+    while (link_ep.readOutbound(&out_buf) != null) {}
+    const syn2_len = buildTcpPacket(.{ 10, 0, 0, 3 }, 5001, .{ 10, 0, 0, 1 }, 80, 2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(3, pkt_buf[0..syn2_len])) {
+        .none => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+    try testing.expect(stack.accept() == null);
+}
+
+test "FullStack: a handshake completing after unlisten gives back its slot" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listen(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // Half-open: the SYN is answered and holds a SYN queue slot.
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(u16, 1), stack.syn_queue_count);
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+
+    // The listener goes away while the ACK is still in flight.
+    try testing.expect(stack.unlisten(80));
+
+    // The ACK lands and the handshake completes with nobody to accept it.
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(1, pkt_buf[0..ack_len])) {
+        .none => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Every resource comes back: the half-open count, the connection slot,
+    // and nothing waits in the accept queue for a caller that cannot know
+    // it is there.
+    try testing.expectEqual(@as(u16, 0), stack.syn_queue_count);
+    try testing.expectEqual(@as(usize, 0), stack.active_count);
+    try testing.expect(stack.accept() == null);
+
+    // And the peer is told, rather than left with a connection we forgot.
+    const rst = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(rst.flags.rst);
 }
 
 test "FullStack: SYN cookie activates under backlog pressure" {
