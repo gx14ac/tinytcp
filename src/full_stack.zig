@@ -1599,6 +1599,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             };
         }
 
+        /// How many holds the table can have at once, so a caller can walk
+        /// it: nextPendingSyn only ever names the oldest, which is the one a
+        /// caller still working on it would see again and again.
+        pub fn pendingSynCapacity(_: *const Self) usize {
+            return max_pending_syns;
+        }
+
         /// How many SYNs are held.
         pub fn pendingSynCount(self: *const Self) usize {
             var n: usize = 0;
@@ -2928,6 +2935,41 @@ test "FullStack: a deferred port holds its SYN instead of answering it" {
     }
     try testing.expectEqual(@as(usize, 1), stack.pendingSynCount());
     try testing.expectEqual(@as(u64, 1200), stack.pendingSynInfo(pending).?.received_ms);
+}
+
+test "FullStack: the pending table can be walked, not just peeked at" {
+    const Small = FullStackWith(16, .{ .max_pending_syns = 4 });
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = Small.init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+    try testing.expectEqual(@as(usize, 4), stack.pendingSynCapacity());
+
+    var pkt_buf: [128]u8 = undefined;
+    var port: u16 = 5000;
+    while (port < 5003) : (port += 1) {
+        const len = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+        switch (stack.injectPacket(@as(u64, port), pkt_buf[0..len])) {
+            .syn_pending => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Every hold is reachable by index, and the oldest keeps being the oldest
+    // until it is settled — which is why a caller working through them needs
+    // the capacity rather than nextPendingSyn alone.
+    var seen: usize = 0;
+    var ports_seen: [3]u16 = .{ 0, 0, 0 };
+    for (0..stack.pendingSynCapacity()) |i| {
+        const info = stack.pendingSynInfo(@intCast(i)) orelse continue;
+        ports_seen[seen] = info.remote_port;
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), seen);
+    try testing.expectEqualSlices(u16, &.{ 5000, 5001, 5002 }, &ports_seen);
+    try testing.expectEqual(stack.nextPendingSyn().?, stack.nextPendingSyn().?);
+
+    // Past the end is not a hold, it is nothing.
+    try testing.expect(stack.pendingSynInfo(4) == null);
 }
 
 test "FullStack: acceptPending finishes the handshake the usual way" {
