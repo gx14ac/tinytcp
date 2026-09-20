@@ -1567,19 +1567,35 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         // Hash index helpers (only meaningful when use_hash_index = true)
         fn connHash4(id: ConnId) u32 {
             var h: u32 = 2166136261; // FNV-1a
-            for (id.local_addr) |b| { h ^= b; h *%= 16777619; }
-            h ^= @as(u32, id.local_port); h *%= 16777619;
-            for (id.remote_addr) |b| { h ^= b; h *%= 16777619; }
-            h ^= @as(u32, id.remote_port); h *%= 16777619;
+            for (id.local_addr) |b| {
+                h ^= b;
+                h *%= 16777619;
+            }
+            h ^= @as(u32, id.local_port);
+            h *%= 16777619;
+            for (id.remote_addr) |b| {
+                h ^= b;
+                h *%= 16777619;
+            }
+            h ^= @as(u32, id.remote_port);
+            h *%= 16777619;
             return h;
         }
 
         fn connHash6(remote6: [16]u8, local6: [16]u8, remote_port: u16, local_port: u16) u32 {
             var h: u32 = 2166136261;
-            for (local6) |b| { h ^= b; h *%= 16777619; }
-            h ^= @as(u32, local_port); h *%= 16777619;
-            for (remote6) |b| { h ^= b; h *%= 16777619; }
-            h ^= @as(u32, remote_port); h *%= 16777619;
+            for (local6) |b| {
+                h ^= b;
+                h *%= 16777619;
+            }
+            h ^= @as(u32, local_port);
+            h *%= 16777619;
+            for (remote6) |b| {
+                h ^= b;
+                h *%= 16777619;
+            }
+            h ^= @as(u32, remote_port);
+            h *%= 16777619;
             return h;
         }
 
@@ -2686,8 +2702,16 @@ test "FullStack: accept queue dequeues established connections" {
     // Send SYN → get accepted event → but connection goes to accept queue
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80,
-        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 10, 0, 0, 2 },
+        5000,
+        .{ 10, 0, 0, 1 },
+        80,
+        1000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     const ev = stack.injectPacket(0, pkt_buf[0..syn_len]);
     switch (ev) {
@@ -2700,8 +2724,16 @@ test "FullStack: accept queue dequeues established connections" {
     const syn_ack_raw = link_ep.readOutbound(&out_buf).?;
     const syn_ack = parseTcpFromRaw(syn_ack_raw).?;
     const ack_len = buildTcpPacket(
-        .{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80,
-        1001, syn_ack.seq + 1, .{ .ack = true }, 65535, &.{}, &pkt_buf,
+        .{ 10, 0, 0, 2 },
+        5000,
+        .{ 10, 0, 0, 1 },
+        80,
+        1001,
+        syn_ack.seq + 1,
+        .{ .ack = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     const ev2 = stack.injectPacket(1, pkt_buf[0..ack_len]);
     // Connection moves from SYN_RECEIVED to ESTABLISHED → enqueued to accept queue
@@ -2734,8 +2766,16 @@ test "FullStack: SYN queue drops when full" {
     var i: u16 = 0;
     while (i < 2) : (i += 1) {
         const syn_len = buildTcpPacket(
-            .{ 10, 0, 0, 2 }, @as(u16, 6000) + i, .{ 10, 0, 0, 1 }, 80,
-            2000 + @as(u32, i) * 100, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+            .{ 10, 0, 0, 2 },
+            @as(u16, 6000) + i,
+            .{ 10, 0, 0, 1 },
+            80,
+            2000 + @as(u32, i) * 100,
+            0,
+            .{ .syn = true },
+            65535,
+            &.{},
+            &pkt_buf,
         );
         _ = stack.injectPacket(0, pkt_buf[0..syn_len]);
         _ = link_ep.readOutbound(&out_buf);
@@ -2743,8 +2783,16 @@ test "FullStack: SYN queue drops when full" {
 
     // SYN queue is full (2/2), next SYN should be dropped
     const syn_len = buildTcpPacket(
-        .{ 10, 0, 0, 3 }, 7000, .{ 10, 0, 0, 1 }, 80,
-        5000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 10, 0, 0, 3 },
+        7000,
+        .{ 10, 0, 0, 1 },
+        80,
+        5000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     const ev = stack.injectPacket(0, pkt_buf[0..syn_len]);
     switch (ev) {
@@ -2763,8 +2811,16 @@ test "FullStack: accept queue full drops cookie connections" {
     // SYN triggers cookie response
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80,
-        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 10, 0, 0, 2 },
+        5000,
+        .{ 10, 0, 0, 1 },
+        80,
+        1000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     _ = stack.injectPacket(100, pkt_buf[0..syn_len]);
 
@@ -2774,8 +2830,16 @@ test "FullStack: accept queue full drops cookie connections" {
 
     // Client sends ACK to complete cookie handshake
     const ack_len = buildTcpPacket(
-        .{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80,
-        1001, syn_ack.seq + 1, .{ .ack = true }, 65535, &.{}, &pkt_buf,
+        .{ 10, 0, 0, 2 },
+        5000,
+        .{ 10, 0, 0, 1 },
+        80,
+        1001,
+        syn_ack.seq + 1,
+        .{ .ack = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     const ev = stack.injectPacket(200, pkt_buf[0..ack_len]);
     // Accept queue is full → connection dropped
@@ -2794,8 +2858,16 @@ test "FullStackWith: embedded_minimal config completes TCP handshake + data" {
     // Client sends SYN
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 192, 168, 1, 2 }, 9000, .{ 192, 168, 1, 1 }, 80,
-        1000, 0, .{ .syn = true }, 2048, &.{}, &pkt_buf,
+        .{ 192, 168, 1, 2 },
+        9000,
+        .{ 192, 168, 1, 1 },
+        80,
+        1000,
+        0,
+        .{ .syn = true },
+        2048,
+        &.{},
+        &pkt_buf,
     );
 
     const ev1 = stack.injectPacket(0, pkt_buf[0..syn_len]);
@@ -2826,8 +2898,16 @@ test "FullStackWith: embedded_minimal config completes TCP handshake + data" {
     stack.conns[0].conn.sender.retx_count = 1;
 
     const ack_len = buildTcpPacket(
-        .{ 192, 168, 1, 2 }, 9000, .{ 192, 168, 1, 1 }, 80,
-        1001, server_isn + 1, .{ .ack = true }, 2048, &.{}, &pkt_buf,
+        .{ 192, 168, 1, 2 },
+        9000,
+        .{ 192, 168, 1, 1 },
+        80,
+        1001,
+        server_isn + 1,
+        .{ .ack = true },
+        2048,
+        &.{},
+        &pkt_buf,
     );
     const ev2 = stack.injectPacket(10, pkt_buf[0..ack_len]);
     switch (ev2) {
@@ -2847,8 +2927,16 @@ test "FullStackWith: embedded_minimal config completes TCP handshake + data" {
 
     // Client sends data
     const data_pkt_len = buildTcpPacket(
-        .{ 192, 168, 1, 2 }, 9000, .{ 192, 168, 1, 1 }, 80,
-        1001, server_isn + 1, .{ .ack = true, .psh = true }, 2048, "hello", &pkt_buf,
+        .{ 192, 168, 1, 2 },
+        9000,
+        .{ 192, 168, 1, 1 },
+        80,
+        1001,
+        server_isn + 1,
+        .{ .ack = true, .psh = true },
+        2048,
+        "hello",
+        &pkt_buf,
     );
     const ev3 = stack.injectPacket(30, pkt_buf[0..data_pkt_len]);
     switch (ev3) {
@@ -2878,8 +2966,16 @@ test "FullStack: hash index lookup (max_conns > 32)" {
     // Send SYN from a client
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80,
-        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 10, 0, 0, 2 },
+        5000,
+        .{ 10, 0, 0, 1 },
+        80,
+        1000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     const ev = stack.injectPacket(0, pkt_buf[0..syn_len]);
     switch (ev) {
@@ -2895,8 +2991,16 @@ test "FullStack: hash index lookup (max_conns > 32)" {
     // Verify multiple connections are found via hash
     var pkt_buf2: [128]u8 = undefined;
     const syn_len2 = buildTcpPacket(
-        .{ 10, 0, 0, 3 }, 6000, .{ 10, 0, 0, 1 }, 80,
-        2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf2,
+        .{ 10, 0, 0, 3 },
+        6000,
+        .{ 10, 0, 0, 1 },
+        80,
+        2000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf2,
     );
     const ev2 = stack.injectPacket(0, pkt_buf2[0..syn_len2]);
     switch (ev2) {
@@ -2916,8 +3020,16 @@ test "FullStack: TCP with corrupted checksum is dropped" {
 
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80,
-        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 10, 0, 0, 2 },
+        5000,
+        .{ 10, 0, 0, 1 },
+        80,
+        1000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
 
     // Corrupt TCP checksum (bytes 36-37 in a standard 20-byte IP + 20-byte TCP header)
@@ -2952,8 +3064,16 @@ test "FullStack: forwarding with SNAT" {
     // Inject a packet from mesh peer destined for the internet (needs SNAT)
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 100, 64, 0, 2 }, 5000, .{ 8, 8, 8, 8 }, 443,
-        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 100, 64, 0, 2 },
+        5000,
+        .{ 8, 8, 8, 8 },
+        443,
+        1000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     const event = stack.injectPacket(100, pkt_buf[0..syn_len]);
     try testing.expectEqual(Event.none, event);
@@ -2995,8 +3115,16 @@ test "FullStack: forwarding mesh-to-mesh (no NAT)" {
     // Mesh peer A (100.64.0.2) → Mesh peer B (100.64.0.3), forwarded via us
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 100, 64, 0, 2 }, 5000, .{ 100, 64, 0, 3 }, 80,
-        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 100, 64, 0, 2 },
+        5000,
+        .{ 100, 64, 0, 3 },
+        80,
+        1000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     _ = stack.injectPacket(100, pkt_buf[0..syn_len]);
 
@@ -3020,8 +3148,16 @@ test "FullStack: forwarding disabled does not forward" {
     // Forwarding NOT enabled — packet to another IP should be silently dropped
     var pkt_buf: [128]u8 = undefined;
     const syn_len = buildTcpPacket(
-        .{ 100, 64, 0, 2 }, 5000, .{ 100, 64, 0, 3 }, 80,
-        1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf,
+        .{ 100, 64, 0, 2 },
+        5000,
+        .{ 100, 64, 0, 3 },
+        80,
+        1000,
+        0,
+        .{ .syn = true },
+        65535,
+        &.{},
+        &pkt_buf,
     );
     const event = stack.injectPacket(100, pkt_buf[0..syn_len]);
     try testing.expectEqual(Event.none, event);
