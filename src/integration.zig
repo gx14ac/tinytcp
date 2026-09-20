@@ -188,6 +188,9 @@ pub fn TunnelStack(comptime max_conns: usize, comptime max_flows: usize) type {
                 .closed => |idx| .{ .tcp_closed = idx },
                 .aborted => |idx| .{ .tcp_closed = idx },
                 .udp_recv => .none,
+                // Only ports registered with listenDeferred hold a SYN, and
+                // this tunnel never registers one.
+                .syn_pending => .none,
                 .none => .none,
             };
         }

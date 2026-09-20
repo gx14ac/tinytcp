@@ -56,6 +56,11 @@ pub const Event = union(enum) {
     aborted: u16,
     /// UDP datagram received on endpoint index.
     udp_recv: u16,
+    /// A SYN arrived for a port registered with listenDeferred and is being
+    /// held: nothing has been sent to the peer yet, and no connection state
+    /// exists. The application settles it with acceptPending or
+    /// rejectPending. The payload is the pending index.
+    syn_pending: u16,
 };
 
 /// Full integrated stack with default config.
@@ -108,6 +113,41 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         };
 
         const max_listen_ports: usize = cfg.max_listen_ports;
+        const max_pending_syns: usize = cfg.max_pending_syns;
+
+        /// The addresses a v6 segment arrived on. ConnId keeps only the low
+        /// four bytes of each, which is enough to tell v4 flows apart and not
+        /// enough for v6: two peers whose addresses end the same way share a
+        /// ConnId.
+        pub const V6Addrs = struct {
+            local: [16]u8,
+            remote: [16]u8,
+        };
+
+        /// A SYN for a deferred port, kept until the application decides. It
+        /// holds what acceptConn would have been called with, so accepting it
+        /// later takes exactly the path an immediate accept would have.
+        pub const PendingSyn = struct {
+            id: ConnId = .{ .local_addr = .{0} ** 4, .local_port = 0, .remote_addr = .{0} ** 4, .remote_port = 0 },
+            peer_seq: u32 = 0,
+            peer_wnd: u16 = 0,
+            peer_opts: @import("transport/tcp/options.zig").NegotiatedOptions = .{},
+            received_ms: u64 = 0,
+            active: bool = false,
+            is_v6: bool = false,
+            local_addr6: [16]u8 = .{0} ** 16,
+            remote_addr6: [16]u8 = .{0} ** 16,
+        };
+
+        /// What a caller needs to decide whether to take the connection.
+        pub const PendingInfo = struct {
+            local_port: u16,
+            remote_addr: [4]u8,
+            remote_port: u16,
+            received_ms: u64,
+            is_v6: bool,
+            remote_addr6: [16]u8,
+        };
         const ReasmT = reassembly_mod.ReassemblerWith(8, cfg.max_reasm_datagram);
         const use_hash_index = max_conns > 32;
         const hash_capacity = if (use_hash_index) max_conns * 2 else 0;
@@ -118,7 +158,10 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         active_count: usize = 0,
         // Listen state (up to 8 simultaneous listen ports)
         listen_ports: [max_listen_ports]u16 = .{0} ** max_listen_ports,
+        /// Parallel to listen_ports: whether that port holds its SYNs.
+        listen_deferred: [max_listen_ports]bool = .{false} ** max_listen_ports,
         listen_count: usize = 0,
+        pending_syns: [max_pending_syns]PendingSyn = [_]PendingSyn{.{}} ** max_pending_syns,
         // SYN queue limit (half-open connections in SYN_RECEIVED)
         syn_queue_limit: u16 = 128,
         // SYN queue count (incremental O(1) tracking)
@@ -320,13 +363,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     @import("transport/tcp/options.zig").parseOptions(ip_payload[20..hdr_len])
                 else
                     @import("transport/tcp/options.zig").NegotiatedOptions{};
-                return self.acceptConn(now_ms, id, seg_seq, seg_wnd, syn_opts);
+                return self.acceptConn(now_ms, id, seg_seq, seg_wnd, syn_opts, null);
             }
 
             // ACK without matching connection: might be completing a SYN-cookie handshake
             if (flags.ack and !flags.syn and !flags.rst) {
                 if (self.validateSynCookie(now_ms, id, seg_ack)) |cookie_mss| {
-                    return self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload);
+                    return self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload, null);
                 }
             }
 
@@ -422,36 +465,18 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     opts_mod6.parseOptions(ip6_payload[20..hdr_len])
                 else
                     opts_mod6.NegotiatedOptions{};
-                const ev = self.acceptConn(now_ms, id, seg_seq, seg_wnd, syn_opts6);
-                // Mark as IPv6 connection and rehash with full v6 key
-                switch (ev) {
-                    .accepted => |idx| {
-                        self.hashRemove(idx);
-                        self.conns[idx].is_v6 = true;
-                        self.conns[idx].local_addr6 = dst6;
-                        self.conns[idx].remote_addr6 = src6;
-                        self.hashInsert(idx);
-                    },
-                    else => {},
-                }
-                return ev;
+                // The addresses go in with the SYN: whether it is answered
+                // now or held for the application, whatever comes of it has
+                // to be v6, and ConnId cannot say so on its own. The accept
+                // paths set them before they hash, so nothing is left to fix
+                // up here.
+                return self.acceptConn(now_ms, id, seg_seq, seg_wnd, syn_opts6, .{ .local = dst6, .remote = src6 });
             }
 
             // ACK without matching connection: might be completing a SYN-cookie handshake
             if (flags.ack and !flags.syn and !flags.rst) {
                 if (self.validateSynCookie(now_ms, id, seg_ack)) |cookie_mss| {
-                    const ev = self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload);
-                    switch (ev) {
-                        .accepted, .data_ready => |idx| {
-                            self.hashRemove(idx);
-                            self.conns[idx].is_v6 = true;
-                            self.conns[idx].local_addr6 = dst6;
-                            self.conns[idx].remote_addr6 = src6;
-                            self.hashInsert(idx);
-                        },
-                        else => {},
-                    }
-                    return ev;
+                    return self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload, .{ .local = dst6, .remote = src6 });
                 }
             }
 
@@ -646,17 +671,50 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// Register a listen port with given backlog.
         /// Can be called multiple times (up to 8 ports). Returns false if full.
         pub fn listen(self: *Self, port: u16, backlog: u16) bool {
-            // Check if already listening on this port
-            for (self.listen_ports[0..self.listen_count]) |p| {
-                if (p == port) return true;
+            return self.listenMode(port, backlog, false);
+        }
+
+        /// Listen on a port without answering its SYNs. A SYN for such a port
+        /// is held — nothing is sent, and no connection state is allocated —
+        /// and reported as Event.syn_pending. The application then calls
+        /// acceptPending, which completes the handshake exactly as an
+        /// immediate accept would have, or rejectPending, which tells the
+        /// peer there is nothing here.
+        ///
+        /// This is for a stack that has to go and find out whether anything
+        /// will answer: a proxy dialling the real service, say. Answering the
+        /// SYN first and closing afterwards tells the peer the port is open
+        /// when it is not, and costs a connection slot for every scan.
+        pub fn listenDeferred(self: *Self, port: u16, backlog: u16) bool {
+            return self.listenMode(port, backlog, true);
+        }
+
+        /// Register a listen port, or change how an existing one answers.
+        fn listenMode(self: *Self, port: u16, backlog: u16, deferred: bool) bool {
+            // Already listening: the call still says how SYNs are answered,
+            // so listen() on a deferred port makes it answer immediately
+            // again and listenDeferred() on a plain one starts holding.
+            for (self.listen_ports[0..self.listen_count], 0..) |p, i| {
+                if (p != port) continue;
+                self.listen_deferred[i] = deferred;
+                self.raiseQueueLimits(backlog);
+                return true;
             }
             if (self.listen_count >= max_listen_ports) return false;
             self.listen_ports[self.listen_count] = port;
+            self.listen_deferred[self.listen_count] = deferred;
             self.listen_count += 1;
+            self.raiseQueueLimits(backlog);
+            return true;
+        }
+
+        /// Raise the shared queue bounds for a listen that was registered.
+        /// A refused listen leaves them alone: it asked for room it did not
+        /// get, and the queues it would have used stay as they were.
+        fn raiseQueueLimits(self: *Self, backlog: u16) void {
             const limit = if (backlog == 0) 128 else backlog;
             self.syn_queue_limit = @max(self.syn_queue_limit, limit);
             self.accept_queue_limit = @max(self.accept_queue_limit, limit);
-            return true;
         }
 
         /// Stop listening on a port and give its slot back. Returns false if
@@ -676,8 +734,25 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 self.listen_count -= 1;
                 // The set has no order, so the last entry fills the hole.
                 self.listen_ports[i] = self.listen_ports[self.listen_count];
+                self.listen_deferred[i] = self.listen_deferred[self.listen_count];
                 self.listen_ports[self.listen_count] = 0;
+                self.listen_deferred[self.listen_count] = false;
+                // Whatever this port was holding will never be settled now,
+                // and the peer is still waiting on a SYN nobody answered.
+                for (&self.pending_syns) |*ps| {
+                    if (!ps.active or ps.id.local_port != port) continue;
+                    self.rstPending(ps);
+                    ps.active = false;
+                }
                 return true;
+            }
+            return false;
+        }
+
+        /// Whether a port holds its SYNs rather than answering them.
+        fn isDeferred(self: *const Self, port: u16) bool {
+            for (self.listen_ports[0..self.listen_count], 0..) |p, i| {
+                if (p == port) return self.listen_deferred[i];
             }
             return false;
         }
@@ -1393,8 +1468,14 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         // Internal: connection management
         // ================================================================
 
-        fn acceptConn(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_wnd: u16, peer_opts: @import("transport/tcp/options.zig").NegotiatedOptions) Event {
+        fn acceptConn(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_wnd: u16, peer_opts: @import("transport/tcp/options.zig").NegotiatedOptions, v6: ?V6Addrs) Event {
             if (!self.isListening(id.local_port)) return .none;
+
+            // Held rather than answered: nothing is sent and no connection
+            // state is allocated until the application says so. Ahead of the
+            // SYN cookie branch on purpose — a cookie is an answer too.
+            if (self.isDeferred(id.local_port)) return self.holdSyn(now_ms, id, peer_seq, peer_wnd, peer_opts, v6);
+
             const half_open = self.synQueueCount();
 
             // SYN cookie mode: when SYN queue is near full, respond statelessly
@@ -1402,8 +1483,16 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 return self.acceptConnStateless(now_ms, id, peer_seq, peer_wnd);
             }
 
+            return self.acceptConnNow(now_ms, id, peer_seq, peer_wnd, peer_opts, v6);
+        }
+
+        /// Allocate the connection and answer the SYN. Split out so a SYN
+        /// that was held can be answered without passing the cookie branch
+        /// again: a cookie keeps no state, and a held SYN exists precisely
+        /// because the application wanted to decide before answering.
+        fn acceptConnNow(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_wnd: u16, peer_opts: @import("transport/tcp/options.zig").NegotiatedOptions, v6: ?V6Addrs) Event {
             // Drop if SYN queue is full
-            if (half_open >= self.syn_queue_limit) return .none;
+            if (self.synQueueCount() >= self.syn_queue_limit) return .none;
 
             const idx = self.allocSlot() orelse return .none;
             const isn = self.nextIsn(now_ms, id);
@@ -1412,6 +1501,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             slot.id = id;
             slot.active = true;
             slot.passive = true;
+            // Every field that says which family this is, because the slot
+            // may have held a v6 connection before: only `active` is cleared
+            // when a connection goes away, and a stale is_v6 would have this
+            // one hashed and sent as v6.
+            slot.is_v6 = v6 != null;
+            slot.local_addr6 = if (v6) |a| a.local else .{0} ** 16;
+            slot.remote_addr6 = if (v6) |a| a.remote else .{0} ** 16;
             slot.conn = ConnectionT.acceptFromSyn(id.local_port, isn, now_ms, peer_opts);
 
             // Process the SYN — produces SYN+ACK output
@@ -1427,6 +1523,154 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             }
 
             return .{ .accepted = @intCast(idx) };
+        }
+
+        /// Keep a SYN for a deferred port. A retransmission of one already
+        /// held refreshes it rather than taking a second slot; a full table
+        /// drops the SYN, which the peer retransmits.
+        fn holdSyn(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_wnd: u16, peer_opts: @import("transport/tcp/options.zig").NegotiatedOptions, v6: ?V6Addrs) Event {
+            for (&self.pending_syns, 0..) |*ps, i| {
+                if (!ps.active or !samePeer(ps, id, v6)) continue;
+                ps.received_ms = now_ms;
+                ps.peer_seq = peer_seq;
+                ps.peer_wnd = peer_wnd;
+                ps.peer_opts = peer_opts;
+                return .{ .syn_pending = @intCast(i) };
+            }
+            for (&self.pending_syns, 0..) |*ps, i| {
+                if (ps.active) continue;
+                ps.* = .{
+                    .id = id,
+                    .peer_seq = peer_seq,
+                    .peer_wnd = peer_wnd,
+                    .peer_opts = peer_opts,
+                    .received_ms = now_ms,
+                    .active = true,
+                    .is_v6 = v6 != null,
+                    .local_addr6 = if (v6) |a| a.local else .{0} ** 16,
+                    .remote_addr6 = if (v6) |a| a.remote else .{0} ** 16,
+                };
+                return .{ .syn_pending = @intCast(i) };
+            }
+            return .none;
+        }
+
+        /// Whether a held SYN and an arriving one come from the same place,
+        /// so a retransmission refreshes its hold instead of taking another.
+        /// For v6 that means the whole address: ConnId keeps four bytes of
+        /// it, and two peers can share those.
+        fn samePeer(ps: *const PendingSyn, id: ConnId, v6: ?V6Addrs) bool {
+            if (ps.is_v6 != (v6 != null)) return false;
+            if (ps.id.local_port != id.local_port or ps.id.remote_port != id.remote_port) return false;
+            if (v6) |a| {
+                return std.mem.eql(u8, &ps.local_addr6, &a.local) and
+                    std.mem.eql(u8, &ps.remote_addr6, &a.remote);
+            }
+            return std.mem.eql(u8, &ps.id.local_addr, &id.local_addr) and
+                std.mem.eql(u8, &ps.id.remote_addr, &id.remote_addr);
+        }
+
+        /// The oldest SYN still waiting for an answer, or null.
+        pub fn nextPendingSyn(self: *const Self) ?u16 {
+            var best: ?u16 = null;
+            var best_ms: u64 = 0;
+            for (self.pending_syns, 0..) |ps, i| {
+                if (!ps.active) continue;
+                if (best == null or ps.received_ms < best_ms) {
+                    best = @intCast(i);
+                    best_ms = ps.received_ms;
+                }
+            }
+            return best;
+        }
+
+        /// What arrived, for a caller deciding whether to take it.
+        pub fn pendingSynInfo(self: *const Self, pending_idx: u16) ?PendingInfo {
+            if (pending_idx >= max_pending_syns) return null;
+            const ps = self.pending_syns[pending_idx];
+            if (!ps.active) return null;
+            return .{
+                .local_port = ps.id.local_port,
+                .remote_addr = ps.id.remote_addr,
+                .remote_port = ps.id.remote_port,
+                .received_ms = ps.received_ms,
+                .is_v6 = ps.is_v6,
+                .remote_addr6 = ps.remote_addr6,
+            };
+        }
+
+        /// How many SYNs are held.
+        pub fn pendingSynCount(self: *const Self) usize {
+            var n: usize = 0;
+            for (self.pending_syns) |ps| {
+                if (ps.active) n += 1;
+            }
+            return n;
+        }
+
+        /// Answer a held SYN: the handshake goes on from here exactly as it
+        /// would have when the SYN arrived, minus the SYN cookie branch. A
+        /// cookie answers statelessly, which is the opposite of what a hold
+        /// is for — the application asked to decide before anything was said
+        /// — and a cookie sent from here would leave the caller believing
+        /// nothing had happened while the peer completed a handshake.
+        ///
+        /// Returns the connection index, or null when the stack has no room
+        /// (no connection slot, or a full SYN queue) and when the port has
+        /// stopped listening. Nothing is sent in those cases: the peer
+        /// retransmits, as it would have all along, and lands back in the
+        /// pending table for the application to try again.
+        pub fn acceptPending(self: *Self, pending_idx: u16, now_ms: u64) ?u16 {
+            if (pending_idx >= max_pending_syns) return null;
+            const ps = self.pending_syns[pending_idx];
+            if (!ps.active) return null;
+            if (!self.isListening(ps.id.local_port)) return null;
+            self.pending_syns[pending_idx].active = false;
+
+            const v6: ?V6Addrs = if (ps.is_v6)
+                .{ .local = ps.local_addr6, .remote = ps.remote_addr6 }
+            else
+                null;
+            switch (self.acceptConnNow(now_ms, ps.id, ps.peer_seq, ps.peer_wnd, ps.peer_opts, v6)) {
+                .accepted => |idx| return idx,
+                else => return null,
+            }
+        }
+
+        /// Refuse a held SYN: the peer is told there is nothing here, rather
+        /// than left waiting on an answer that will not come.
+        pub fn rejectPending(self: *Self, pending_idx: u16) void {
+            if (pending_idx >= max_pending_syns) return;
+            const ps = &self.pending_syns[pending_idx];
+            if (!ps.active) return;
+            self.rstPending(ps);
+            ps.active = false;
+        }
+
+        /// Drop SYNs held longer than `timeout_ms` without an answer, the way
+        /// a half-open connection times out. Returns how many were dropped.
+        /// The peer is not told: from its side the SYN was simply lost, which
+        /// is what it would have been had the stack not been listening.
+        pub fn expirePendingSyns(self: *Self, now_ms: u64, timeout_ms: u64) usize {
+            var n: usize = 0;
+            for (&self.pending_syns) |*ps| {
+                if (!ps.active or now_ms -| ps.received_ms < timeout_ms) continue;
+                ps.active = false;
+                n += 1;
+            }
+            return n;
+        }
+
+        /// RST a held SYN's sender: ack its sequence, as a closed port does.
+        /// A v6 hold is answered over v6 — ConnId carries four bytes of the
+        /// address, which would make an IPv4 packet addressed to whatever
+        /// those four bytes happen to spell.
+        fn rstPending(self: *Self, ps: *const PendingSyn) void {
+            if (ps.is_v6) {
+                self.buildAndSend6(ps.local_addr6, ps.remote_addr6, ps.id.local_port, ps.id.remote_port, .{ .rst = true, .ack = true }, 0, ps.peer_seq +% 1, 0, &.{});
+                return;
+            }
+            self.sendRst(ps.id.local_addr, ps.id.local_port, ps.id.remote_addr, ps.id.remote_port, 0, ps.peer_seq +% 1);
         }
 
         /// Stateless SYN+ACK using SYN cookie (no connection state allocated).
@@ -1446,12 +1690,18 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         /// Accept a connection validated by SYN cookie (reconstruct state from ACK).
-        fn acceptCookieConn(self: *Self, now_ms: u64, id: ConnId, seg_seq: u32, seg_ack: u32, seg_wnd: u16, cookie_mss: u16, payload: []const u8) Event {
+        fn acceptCookieConn(self: *Self, now_ms: u64, id: ConnId, seg_seq: u32, seg_ack: u32, seg_wnd: u16, cookie_mss: u16, payload: []const u8, v6: ?V6Addrs) Event {
             // The cookie was minted while the port was listening, and the
             // listener can be gone by the time the ACK carrying it arrives.
-            // The peer believes it has a connection, so say otherwise.
+            // The peer believes it has a connection, so say otherwise — over
+            // the family it spoke, since ConnId only knows four bytes of a v6
+            // address.
             if (!self.isListening(id.local_port)) {
-                self.sendRst(id.local_addr, id.local_port, id.remote_addr, id.remote_port, seg_ack, seg_seq);
+                if (v6) |a| {
+                    self.buildAndSend6(a.local, a.remote, id.local_port, id.remote_port, .{ .rst = true, .ack = true }, seg_ack, seg_seq, 0, &.{});
+                } else {
+                    self.sendRst(id.local_addr, id.local_port, id.remote_addr, id.remote_port, seg_ack, seg_seq);
+                }
                 return .none;
             }
 
@@ -1465,6 +1715,12 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             slot.id = id;
             slot.active = true;
             slot.passive = true;
+            // The same three fields acceptConnNow writes, for the same
+            // reason: a closed connection leaves them behind, and this slot
+            // may last have held one of the other family.
+            slot.is_v6 = v6 != null;
+            slot.local_addr6 = if (v6) |a| a.local else .{0} ** 16;
+            slot.remote_addr6 = if (v6) |a| a.remote else .{0} ** 16;
             slot.conn = .{
                 .state = .established,
                 .local_port = id.local_port,
@@ -1955,6 +2211,78 @@ pub fn buildTcpPacket(
     tcp.computeChecksumIpv4(src_addr, dst_addr, out[ip_hlen..total]);
 
     return total;
+}
+
+/// Build a TCP segment in an IPv6 packet (for tests).
+pub fn buildTcp6Packet(
+    src_addr: [16]u8,
+    src_port: u16,
+    dst_addr: [16]u8,
+    dst_port: u16,
+    seq: u32,
+    ack_val: u32,
+    flags: tcp_header.Flags,
+    window: u16,
+    payload: []const u8,
+    out: []u8,
+) usize {
+    const ip6_hlen: usize = 40;
+    const tcp_hlen: usize = 20;
+    const tcp_total: usize = tcp_hlen + payload.len;
+    const total: usize = ip6_hlen + tcp_total;
+
+    var ip6 = ipv6_header.MutableHeader.init(out[0..ip6_hlen]) catch unreachable;
+    ip6.setPayloadLen(@intCast(tcp_total));
+    ip6.setNextHeader(.tcp);
+    ip6.setHopLimit(64);
+    ip6.setSrcAddr(src_addr);
+    ip6.setDstAddr(dst_addr);
+
+    var tcp = tcp_header.MutableHeader.init(out[ip6_hlen .. ip6_hlen + tcp_hlen]) catch unreachable;
+    tcp.setSrcPort(src_port);
+    tcp.setDstPort(dst_port);
+    tcp.setSeqNum(seq);
+    tcp.setAckNum(ack_val);
+    tcp.setFlags(flags);
+    tcp.setWindowSize(window);
+
+    if (payload.len > 0) {
+        @memcpy(out[ip6_hlen + tcp_hlen .. ip6_hlen + tcp_hlen + payload.len], payload);
+    }
+    {
+        const cksum_mod = @import("checksum.zig");
+        const seg = out[ip6_hlen..total];
+        seg[16] = 0;
+        seg[17] = 0;
+        const ph = cksum_mod.pseudoHeaderIpv6(src_addr, dst_addr, 6, @intCast(tcp_total));
+        std.mem.writeInt(u16, seg[16..18], cksum_mod.finish(cksum_mod.accumulate(ph, seg)), .big);
+    }
+    return total;
+}
+
+/// Parse a TCP segment out of a raw IPv6 packet (for tests). Null for
+/// anything that is not IPv6 carrying TCP, so a test can tell a v6 answer
+/// from a v4 one rather than reading whichever bytes happen to be there.
+pub fn parseTcp6FromRaw(raw: []const u8) ?struct {
+    src_addr: [16]u8,
+    dst_addr: [16]u8,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: tcp_header.Flags,
+} {
+    if (raw.len < 60 or raw[0] >> 4 != 6 or raw[6] != 6) return null;
+    const tcp = tcp_header.Header.parse(raw[40..]) catch return null;
+    return .{
+        .src_addr = raw[8..24].*,
+        .dst_addr = raw[24..40].*,
+        .src_port = tcp.srcPort(),
+        .dst_port = tcp.dstPort(),
+        .seq = tcp.seqNum(),
+        .ack = tcp.ackNum(),
+        .flags = tcp.flags(),
+    };
 }
 
 /// Parse a TCP segment from a raw IPv4 packet (for test verification).
@@ -2565,6 +2893,453 @@ test "FullStack: a handshake completing after unlisten gives back its slot" {
     // And the peer is told, rather than left with a connection we forgot.
     const rst = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
     try testing.expect(rst.flags.rst);
+}
+
+test "FullStack: a deferred port holds its SYN instead of answering it" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    try testing.expect(stack.listenDeferred(80, 128));
+
+    var pkt_buf: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pending = switch (stack.injectPacket(10, pkt_buf[0..syn_len])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Nothing has been said to the peer, and nothing has been allocated.
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+    try testing.expectEqual(@as(usize, 0), stack.active_count);
+    try testing.expectEqual(@as(u16, 0), stack.syn_queue_count);
+    try testing.expectEqual(@as(usize, 1), stack.pendingSynCount());
+    try testing.expectEqual(pending, stack.nextPendingSyn().?);
+
+    const info = stack.pendingSynInfo(pending).?;
+    try testing.expectEqual(@as(u16, 80), info.local_port);
+    try testing.expectEqual(@as(u16, 5000), info.remote_port);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &info.remote_addr);
+    try testing.expectEqual(@as(u64, 10), info.received_ms);
+
+    // A retransmission of the same SYN refreshes the hold, it does not take
+    // a second slot.
+    switch (stack.injectPacket(1200, pkt_buf[0..syn_len])) {
+        .syn_pending => |i| try testing.expectEqual(pending, i),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), stack.pendingSynCount());
+    try testing.expectEqual(@as(u64, 1200), stack.pendingSynInfo(pending).?.received_ms);
+}
+
+test "FullStack: acceptPending finishes the handshake the usual way" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pending = switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // The application has found something to answer with.
+    const conn_idx = stack.acceptPending(pending, 50) orelse return error.NoConnection;
+    try testing.expectEqual(@as(usize, 0), stack.pendingSynCount());
+    try testing.expect(stack.nextPendingSyn() == null);
+
+    // Now the peer hears a SYN+ACK that acknowledges the SYN it sent.
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(syn_ack.flags.syn and syn_ack.flags.ack);
+    try testing.expectEqual(@as(u32, 1001), syn_ack.ack);
+    try testing.expectEqual(@as(u16, 80), syn_ack.src_port);
+
+    // And the handshake completes into the accept queue, as a plain listen
+    // would have.
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(60, pkt_buf[0..ack_len])) {
+        .accepted => |i| try testing.expectEqual(conn_idx, i),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(conn_idx, stack.accept().?);
+    try testing.expectEqual(tcp_connection.State.established, stack.connState(conn_idx).?);
+
+    // Settling the same hold twice changes nothing.
+    try testing.expect(stack.acceptPending(pending, 70) == null);
+}
+
+test "FullStack: rejectPending tells the peer there is nothing here" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pending = switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    stack.rejectPending(pending);
+    try testing.expectEqual(@as(usize, 0), stack.pendingSynCount());
+
+    // A refusal, not silence: the peer stops waiting rather than
+    // retransmitting until it gives up.
+    const rst = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(rst.flags.rst);
+    try testing.expectEqual(@as(u32, 1001), rst.ack);
+    try testing.expectEqual(@as(usize, 0), stack.active_count);
+
+    stack.rejectPending(pending); // twice is nothing
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+}
+
+test "FullStack: the pending table is bounded, and holds expire" {
+    const Small = FullStackWith(16, .{ .max_pending_syns = 2 });
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = Small.init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var port: u16 = 5000;
+    while (port < 5002) : (port += 1) {
+        const len = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+        switch (stack.injectPacket(100, pkt_buf[0..len])) {
+            .syn_pending => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), stack.pendingSynCount());
+
+    // A third is dropped, which is what the peer sees from a stack that is
+    // not listening at all: no answer, and it retransmits.
+    const third = buildTcpPacket(.{ 10, 0, 0, 2 }, 5002, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(100, pkt_buf[0..third])) {
+        .none => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+
+    // Holds nobody settled time out, and silently: to the peer the SYN was
+    // lost, which is the same thing it would have been.
+    try testing.expectEqual(@as(usize, 0), stack.expirePendingSyns(1000, 5000));
+    try testing.expectEqual(@as(usize, 2), stack.expirePendingSyns(5100, 5000));
+    try testing.expectEqual(@as(usize, 0), stack.pendingSynCount());
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+}
+
+test "FullStack: unlisten resets the SYNs that port was holding" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+    _ = stack.listenDeferred(81, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const a = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..a]);
+    const b = buildTcpPacket(.{ 10, 0, 0, 2 }, 5001, .{ 10, 0, 0, 1 }, 81, 2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..b]);
+    try testing.expectEqual(@as(usize, 2), stack.pendingSynCount());
+
+    // The listener goes away while it is holding someone's SYN: that peer is
+    // waiting on an answer nobody will ever give.
+    try testing.expect(stack.unlisten(80));
+    try testing.expectEqual(@as(usize, 1), stack.pendingSynCount());
+    const rst = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(rst.flags.rst);
+    try testing.expectEqual(@as(u16, 80), rst.src_port);
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+
+    // The other port keeps what it was holding.
+    try testing.expectEqual(@as(u16, 81), stack.pendingSynInfo(stack.nextPendingSyn().?).?.local_port);
+}
+
+test "FullStack: a port can stop and start deferring" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // Plain listen first: the SYN is answered where it arrives.
+    _ = stack.listen(80, 128);
+    const syn = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(0, pkt_buf[0..syn])) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?.flags.syn);
+    try testing.expectEqual(@as(usize, 1), stack.listen_count);
+
+    // The same port, now deferring, takes no second listen slot and holds.
+    try testing.expect(stack.listenDeferred(80, 128));
+    try testing.expectEqual(@as(usize, 1), stack.listen_count);
+    const syn2 = buildTcpPacket(.{ 10, 0, 0, 3 }, 5001, .{ 10, 0, 0, 1 }, 80, 2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(0, pkt_buf[0..syn2])) {
+        .syn_pending => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+
+    // And back again.
+    try testing.expect(stack.listen(80, 128));
+    const syn3 = buildTcpPacket(.{ 10, 0, 0, 4 }, 5002, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(0, pkt_buf[0..syn3])) {
+        .accepted => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?.flags.syn);
+}
+
+fn v6Addr(last: u8) [16]u8 {
+    var a: [16]u8 = .{0} ** 16;
+    a[0] = 0xfd;
+    a[15] = last;
+    return a;
+}
+
+test "FullStack: a held v6 SYN is refused over v6, not over v4" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    const us = v6Addr(1);
+    const them = v6Addr(2);
+    stack.setIpv6Addr(us);
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn_len = buildTcp6Packet(them, 5000, us, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pending = switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(stack.pendingSynInfo(pending).?.is_v6);
+    try testing.expectEqualSlices(u8, &them, &stack.pendingSynInfo(pending).?.remote_addr6);
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+
+    stack.rejectPending(pending);
+
+    // Over v6, addressed to the peer that sent the SYN. ConnId keeps four
+    // bytes of a v6 address, so a v4 RST here would be sent to whatever
+    // those four bytes spell.
+    const raw = link_ep.readOutbound(&out_buf).?;
+    const rst = parseTcp6FromRaw(raw) orelse return error.NotIpv6;
+    try testing.expect(rst.flags.rst);
+    try testing.expectEqualSlices(u8, &them, &rst.dst_addr);
+    try testing.expectEqualSlices(u8, &us, &rst.src_addr);
+    try testing.expectEqual(@as(u32, 1001), rst.ack);
+    try testing.expectEqual(@as(u16, 5000), rst.dst_port);
+}
+
+test "FullStack: two v6 peers that share four bytes are two holds" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    const us = v6Addr(1);
+    stack.setIpv6Addr(us);
+    _ = stack.listenDeferred(80, 128);
+
+    // Same low four bytes, different addresses: one ConnId, two peers.
+    var a = v6Addr(2);
+    var b = v6Addr(2);
+    a[1] = 0x01;
+    b[1] = 0x02;
+
+    var pkt_buf: [128]u8 = undefined;
+    const syn_a = buildTcp6Packet(a, 5000, us, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pa = switch (stack.injectPacket(0, pkt_buf[0..syn_a])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    const syn_b = buildTcp6Packet(b, 5000, us, 80, 2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pb = switch (stack.injectPacket(0, pkt_buf[0..syn_b])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    try testing.expect(pa != pb);
+    try testing.expectEqual(@as(usize, 2), stack.pendingSynCount());
+    try testing.expectEqualSlices(u8, &a, &stack.pendingSynInfo(pa).?.remote_addr6);
+    try testing.expectEqualSlices(u8, &b, &stack.pendingSynInfo(pb).?.remote_addr6);
+}
+
+test "FullStack: acceptPending on a v6 hold answers over v6" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    const us = v6Addr(1);
+    const them = v6Addr(2);
+    stack.setIpv6Addr(us);
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn_len = buildTcp6Packet(them, 5000, us, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pending = switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    const idx = stack.acceptPending(pending, 10) orelse return error.NoConnection;
+    const syn_ack = parseTcp6FromRaw(link_ep.readOutbound(&out_buf).?) orelse return error.NotIpv6;
+    try testing.expect(syn_ack.flags.syn and syn_ack.flags.ack);
+    try testing.expectEqual(@as(u32, 1001), syn_ack.ack);
+    try testing.expectEqualSlices(u8, &them, &syn_ack.dst_addr);
+
+    // And the peer's ACK finds the connection under its full v6 key.
+    const ack_len = buildTcp6Packet(them, 5000, us, 80, 1001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(20, pkt_buf[0..ack_len])) {
+        .accepted => |i| try testing.expectEqual(idx, i),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "FullStack: a v4 accept does not inherit a v6 connection's slot" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    const us6 = v6Addr(1);
+    const them6 = v6Addr(2);
+    stack.setIpv6Addr(us6);
+    _ = stack.listen(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // A v6 connection takes slot 0 and then goes away.
+    const syn6 = buildTcp6Packet(them6, 5000, us6, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const v6_idx = switch (stack.injectPacket(0, pkt_buf[0..syn6])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(stack.conns[v6_idx].is_v6);
+    stack.conns[v6_idx].active = false; // as a closed connection leaves it
+    stack.active_count -|= 1;
+    stack.syn_queue_count -|= 1;
+    while (link_ep.readOutbound(&out_buf) != null) {}
+
+    // A v4 SYN reuses that slot. Only `active` was cleared, so whatever says
+    // "this is v6" has to be set by the accept, not left over.
+    const syn4 = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const v4_idx = switch (stack.injectPacket(10, pkt_buf[0..syn4])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(v6_idx, v4_idx); // the same slot, reused
+    try testing.expect(!stack.conns[v4_idx].is_v6);
+
+    // The SYN+ACK goes out as IPv4, and the peer's ACK finds the connection.
+    const raw = link_ep.readOutbound(&out_buf).?;
+    try testing.expect(parseTcp6FromRaw(raw) == null);
+    const syn_ack = parseTcpFromRaw(raw).?;
+    try testing.expect(syn_ack.flags.syn and syn_ack.flags.ack);
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(20, pkt_buf[0..ack_len])) {
+        .accepted => |i| try testing.expectEqual(v4_idx, i),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "FullStack: a cookie accept does not inherit a v6 connection's slot" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    const us6 = v6Addr(1);
+    const them6 = v6Addr(2);
+    stack.setIpv6Addr(us6);
+    _ = stack.listen(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // A v6 connection takes slot 0 and then goes away.
+    const syn6 = buildTcp6Packet(them6, 5000, us6, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const v6_idx = switch (stack.injectPacket(0, pkt_buf[0..syn6])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(stack.conns[v6_idx].is_v6);
+    stack.conns[v6_idx].active = false; // as a closed connection leaves it
+    stack.active_count -|= 1;
+    stack.syn_queue_count -|= 1;
+    while (link_ep.readOutbound(&out_buf) != null) {}
+
+    // Under load the stack answers with cookies, so a v4 SYN gets one and
+    // the handshake completes through acceptCookieConn — the other passive
+    // open, which reuses that same slot.
+    stack.syn_cookie_threshold = 0;
+    const syn4 = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(10, pkt_buf[0..syn4]);
+    const cookie_syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(cookie_syn_ack.flags.syn and cookie_syn_ack.flags.ack);
+
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, cookie_syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    const v4_idx = switch (stack.injectPacket(20, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(v6_idx, v4_idx); // the same slot, reused
+    try testing.expect(!stack.conns[v4_idx].is_v6);
+
+    // Data on the new connection is answered over IPv4, and finds it.
+    const data_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, cookie_syn_ack.seq +% 1, .{ .ack = true, .psh = true }, 65535, "hi", &pkt_buf);
+    _ = stack.injectPacket(30, pkt_buf[0..data_len]);
+    var data: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), stack.read(v4_idx, &data));
+    _ = stack.poll(600); // the ACK is delayed; this sends it
+    const reply = link_ep.readOutbound(&out_buf) orelse return error.NoAck;
+    try testing.expect(parseTcp6FromRaw(reply) == null);
+    try testing.expectEqual(@as(u16, 6000), parseTcpFromRaw(reply).?.dst_port);
+}
+
+test "FullStack: accepting a held SYN does not fall back to a cookie" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const pending = switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+        .syn_pending => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Half-open connections elsewhere put the stack over the cookie
+    // threshold. A cookie answers statelessly, which would leave the caller
+    // told "no room" while the peer went on to complete a handshake.
+    stack.syn_cookie_threshold = 0;
+
+    const idx = stack.acceptPending(pending, 50) orelse return error.NoConnection;
+    try testing.expectEqual(@as(usize, 1), stack.active_count);
+    try testing.expectEqual(@as(u16, 1), stack.syn_queue_count);
+    try testing.expectEqual(tcp_connection.State.syn_received, stack.connState(idx).?);
+
+    // The handshake completes into the accept queue, with the state the
+    // stack kept — not a cookie it would have to re-derive.
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    switch (stack.injectPacket(60, pkt_buf[0..ack_len])) {
+        .accepted => |i| try testing.expectEqual(idx, i),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(idx, stack.accept().?);
+}
+
+test "FullStack: a refused listen does not raise the queue limits" {
+    const Small = FullStackWith(8, .{ .max_listen_ports = 1 });
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = Small.init(&link_ep, .{ 10, 0, 0, 1 });
+
+    try testing.expect(stack.listen(80, 16));
+    const syn_limit = stack.syn_queue_limit;
+    const accept_limit = stack.accept_queue_limit;
+
+    // No slot for it, so it asked for room it did not get.
+    try testing.expect(!stack.listen(81, 4096));
+    try testing.expectEqual(syn_limit, stack.syn_queue_limit);
+    try testing.expectEqual(accept_limit, stack.accept_queue_limit);
+
+    // A port already in the set still gets what it asks for.
+    try testing.expect(stack.listen(80, 4096));
+    try testing.expectEqual(@as(u16, 4096), stack.syn_queue_limit);
 }
 
 test "FullStack: SYN cookie activates under backlog pressure" {
