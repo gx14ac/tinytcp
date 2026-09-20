@@ -14,6 +14,11 @@ const min_rto_ms: u32 = 1000;
 /// Maximum RTO (RFC 6298 section 2.5): 60 seconds.
 const max_rto_ms: u32 = 60_000;
 
+/// The largest sample worth believing. Anything above the maximum RTO
+/// teaches us nothing about the round trip and, taken at face value, would
+/// push SRTT high enough to overflow the arithmetic below.
+pub const max_sample_ms: u32 = max_rto_ms;
+
 /// Minimum safety margin for RTO (accounts for delayed ACKs).
 const min_rto_margin_ms: u32 = 200;
 
@@ -53,10 +58,14 @@ pub const RttEstimator = struct {
         }
     }
 
-    /// Feed an explicit RTT sample (e.g., from TCP Timestamps).
+    /// Feed an explicit RTT sample (e.g., from TCP Timestamps). A sample
+    /// beyond the maximum RTO is ignored rather than clamped: clamping it to
+    /// u32 max used to put SRTT within a hair of the type's range, where the
+    /// RTO calculation overflowed.
     pub fn update(self: *RttEstimator, sample_ms: u64) void {
+        if (sample_ms == 0 or sample_ms > max_sample_ms) return;
         self.retransmit_count = 0;
-        self.updateRtt(@intCast(@min(sample_ms, std.math.maxInt(u32))));
+        self.updateRtt(@intCast(sample_ms));
     }
 
     /// Process an ACK. If it acknowledges our timed segment, compute RTT.
@@ -65,8 +74,13 @@ pub const RttEstimator = struct {
 
         // Check if this ACK completes our sample
         if (self.sampling and seqGte(ack_seq, self.sample_seq)) {
-            const rtt_sample = @as(u32, @intCast(now_ms - self.sample_sent_at));
-            self.updateRtt(rtt_sample);
+            // Saturating: a clock that went backwards gives no sample rather
+            // than a panic, and one that jumped forwards gives a discarded
+            // one rather than an SRTT nothing can recover from.
+            const rtt_sample = now_ms -| self.sample_sent_at;
+            if (rtt_sample > 0 and rtt_sample <= max_sample_ms) {
+                self.updateRtt(@intCast(rtt_sample));
+            }
             self.sampling = false;
         }
     }
@@ -77,18 +91,20 @@ pub const RttEstimator = struct {
             // RFC 6298 (2.3): subsequent measurements
             // RTTVAR = (1-beta) * RTTVAR + beta * |SRTT - R'|  (beta = 1/4)
             const diff = if (sample_ms > srtt) sample_ms - srtt else srtt - sample_ms;
-            self.rttvar = (self.rttvar * 3 + diff) / 4;
+            self.rttvar = (self.rttvar *| 3 +| diff) / 4;
             // SRTT = (1-alpha) * SRTT + alpha * R'  (alpha = 1/8)
-            self.srtt = (srtt * 7 + sample_ms) / 8;
+            self.srtt = (srtt *| 7 +| sample_ms) / 8;
         } else {
             // RFC 6298 (2.2): first measurement
             self.srtt = sample_ms;
             self.rttvar = sample_ms / 2;
         }
 
-        // RFC 6298 (2.3): RTO = SRTT + max(G, K*RTTVAR) where K=4
-        const margin = @max(min_rto_margin_ms, self.rttvar * 4);
-        self.rto = std.math.clamp(self.srtt.? + margin, min_rto_ms, max_rto_ms);
+        // RFC 6298 (2.3): RTO = SRTT + max(G, K*RTTVAR) where K=4.
+        // Saturating, so the bound is the bound: the clamp below decides the
+        // answer, not whether the addition fits in the type.
+        const margin = @max(min_rto_margin_ms, self.rttvar *| 4);
+        self.rto = std.math.clamp(self.srtt.? +| margin, min_rto_ms, max_rto_ms);
     }
 
     /// Called on retransmission timeout: exponential backoff (RFC 6298 section 5.5).
@@ -192,4 +208,46 @@ test "RttEstimator: explicit update from timestamps" {
     rtt.update(100);
     // SRTT = (80*7 + 100)/8 = 82
     try testing.expect(rtt.srtt.? >= 80 and rtt.srtt.? <= 85);
+}
+
+test "RttEstimator: a sample nothing could have measured is ignored" {
+    var rtt = RttEstimator{};
+    rtt.update(120);
+    const srtt = rtt.srtt.?;
+    const rto = rtt.rto;
+
+    // A machine up longer than 49.7 days used to hand the estimator the age
+    // of its clock instead of a round trip, and the RTO arithmetic overflowed
+    // on the next line of the same function. Now such a sample teaches it
+    // nothing, and the state it had is still there.
+    rtt.update(4_294_967_295);
+    rtt.update(std.math.maxInt(u64));
+    rtt.update(max_sample_ms + 1);
+    try testing.expectEqual(srtt, rtt.srtt.?);
+    try testing.expectEqual(rto, rtt.rto);
+
+    // The largest believable one is believed, and the RTO stays inside its
+    // bounds rather than wrapping past them.
+    rtt.update(max_sample_ms);
+    try testing.expect(rtt.rto <= max_rto_ms);
+    try testing.expect(rtt.rto >= min_rto_ms);
+}
+
+test "RttEstimator: an ACK measured against a clock that moved oddly" {
+    var rtt = RttEstimator{};
+
+    // Backwards: no sample, no panic.
+    rtt.startSample(5_000, 100);
+    rtt.onAck(4_000, 200);
+    try testing.expect(rtt.srtt == null);
+
+    // Forwards by more than any round trip: still no sample.
+    rtt.startSample(5_000, 300);
+    rtt.onAck(5_000 + @as(u64, max_sample_ms) + 1, 400);
+    try testing.expect(rtt.srtt == null);
+
+    // And an ordinary one is taken.
+    rtt.startSample(10_000, 500);
+    rtt.onAck(10_120, 600);
+    try testing.expectEqual(@as(u32, 120), rtt.srtt.?);
 }
