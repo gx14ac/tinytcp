@@ -44,6 +44,11 @@ pub const Config = struct {
     /// their own, when the endpoint is closed.
     max_udp_endpoints: usize = 16,
 
+    /// SYNs held at once for ports that defer their accept. Only ports
+    /// registered with listenDeferred use these; a stack that never defers
+    /// carries the array and nothing else.
+    max_pending_syns: usize = 16,
+
     /// Minimal embedded profile: ~4KB per connection.
     pub const embedded_minimal = Config{
         .send_buf_size = 1024,

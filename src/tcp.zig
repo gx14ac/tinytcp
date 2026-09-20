@@ -128,7 +128,9 @@ pub fn Tcp(comptime StackT: type) type {
                         }
                         return .none;
                     },
-                    .established, .udp_recv, .none => return .none,
+                    // syn_pending only reaches a port registered with
+                    // listenDeferred, and this Server registers plain ones.
+                    .established, .udp_recv, .syn_pending, .none => return .none,
                 }
             }
 
