@@ -369,7 +369,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             // ACK without matching connection: might be completing a SYN-cookie handshake
             if (flags.ack and !flags.syn and !flags.rst) {
                 if (self.validateSynCookie(now_ms, id, seg_ack)) |cookie_mss| {
-                    return self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload);
+                    return self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload, null);
                 }
             }
 
@@ -467,34 +467,16 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     opts_mod6.NegotiatedOptions{};
                 // The addresses go in with the SYN: whether it is answered
                 // now or held for the application, whatever comes of it has
-                // to be v6, and ConnId cannot say so on its own.
-                const ev = self.acceptConn(now_ms, id, seg_seq, seg_wnd, syn_opts6, .{ .local = dst6, .remote = src6 });
-                // Rehash an accepted connection with the full v6 key.
-                switch (ev) {
-                    .accepted => |idx| {
-                        self.hashRemove(idx);
-                        self.hashInsert(idx);
-                    },
-                    else => {},
-                }
-                return ev;
+                // to be v6, and ConnId cannot say so on its own. The accept
+                // paths set them before they hash, so nothing is left to fix
+                // up here.
+                return self.acceptConn(now_ms, id, seg_seq, seg_wnd, syn_opts6, .{ .local = dst6, .remote = src6 });
             }
 
             // ACK without matching connection: might be completing a SYN-cookie handshake
             if (flags.ack and !flags.syn and !flags.rst) {
                 if (self.validateSynCookie(now_ms, id, seg_ack)) |cookie_mss| {
-                    const ev = self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload);
-                    switch (ev) {
-                        .accepted, .data_ready => |idx| {
-                            self.hashRemove(idx);
-                            self.conns[idx].is_v6 = true;
-                            self.conns[idx].local_addr6 = dst6;
-                            self.conns[idx].remote_addr6 = src6;
-                            self.hashInsert(idx);
-                        },
-                        else => {},
-                    }
-                    return ev;
+                    return self.acceptCookieConn(now_ms, id, seg_seq, seg_ack, seg_wnd, cookie_mss, payload, .{ .local = dst6, .remote = src6 });
                 }
             }
 
@@ -1650,15 +1632,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             else
                 null;
             switch (self.acceptConnNow(now_ms, ps.id, ps.peer_seq, ps.peer_wnd, ps.peer_opts, v6)) {
-                .accepted => |idx| {
-                    if (ps.is_v6) {
-                        // Rehash with the full v6 key, as the immediate path
-                        // does: acceptConnNow inserts with what ConnId knows.
-                        self.hashRemove(idx);
-                        self.hashInsert(idx);
-                    }
-                    return idx;
-                },
+                .accepted => |idx| return idx,
                 else => return null,
             }
         }
@@ -1716,12 +1690,18 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         /// Accept a connection validated by SYN cookie (reconstruct state from ACK).
-        fn acceptCookieConn(self: *Self, now_ms: u64, id: ConnId, seg_seq: u32, seg_ack: u32, seg_wnd: u16, cookie_mss: u16, payload: []const u8) Event {
+        fn acceptCookieConn(self: *Self, now_ms: u64, id: ConnId, seg_seq: u32, seg_ack: u32, seg_wnd: u16, cookie_mss: u16, payload: []const u8, v6: ?V6Addrs) Event {
             // The cookie was minted while the port was listening, and the
             // listener can be gone by the time the ACK carrying it arrives.
-            // The peer believes it has a connection, so say otherwise.
+            // The peer believes it has a connection, so say otherwise — over
+            // the family it spoke, since ConnId only knows four bytes of a v6
+            // address.
             if (!self.isListening(id.local_port)) {
-                self.sendRst(id.local_addr, id.local_port, id.remote_addr, id.remote_port, seg_ack, seg_seq);
+                if (v6) |a| {
+                    self.buildAndSend6(a.local, a.remote, id.local_port, id.remote_port, .{ .rst = true, .ack = true }, seg_ack, seg_seq, 0, &.{});
+                } else {
+                    self.sendRst(id.local_addr, id.local_port, id.remote_addr, id.remote_port, seg_ack, seg_seq);
+                }
                 return .none;
             }
 
@@ -1735,6 +1715,12 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             slot.id = id;
             slot.active = true;
             slot.passive = true;
+            // The same three fields acceptConnNow writes, for the same
+            // reason: a closed connection leaves them behind, and this slot
+            // may last have held one of the other family.
+            slot.is_v6 = v6 != null;
+            slot.local_addr6 = if (v6) |a| a.local else .{0} ** 16;
+            slot.remote_addr6 = if (v6) |a| a.remote else .{0} ** 16;
             slot.conn = .{
                 .state = .established,
                 .local_port = id.local_port,
@@ -3250,6 +3236,57 @@ test "FullStack: a v4 accept does not inherit a v6 connection's slot" {
         .accepted => |i| try testing.expectEqual(v4_idx, i),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "FullStack: a cookie accept does not inherit a v6 connection's slot" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    const us6 = v6Addr(1);
+    const them6 = v6Addr(2);
+    stack.setIpv6Addr(us6);
+    _ = stack.listen(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // A v6 connection takes slot 0 and then goes away.
+    const syn6 = buildTcp6Packet(them6, 5000, us6, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const v6_idx = switch (stack.injectPacket(0, pkt_buf[0..syn6])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(stack.conns[v6_idx].is_v6);
+    stack.conns[v6_idx].active = false; // as a closed connection leaves it
+    stack.active_count -|= 1;
+    stack.syn_queue_count -|= 1;
+    while (link_ep.readOutbound(&out_buf) != null) {}
+
+    // Under load the stack answers with cookies, so a v4 SYN gets one and
+    // the handshake completes through acceptCookieConn — the other passive
+    // open, which reuses that same slot.
+    stack.syn_cookie_threshold = 0;
+    const syn4 = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(10, pkt_buf[0..syn4]);
+    const cookie_syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(cookie_syn_ack.flags.syn and cookie_syn_ack.flags.ack);
+
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, cookie_syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    const v4_idx = switch (stack.injectPacket(20, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(v6_idx, v4_idx); // the same slot, reused
+    try testing.expect(!stack.conns[v4_idx].is_v6);
+
+    // Data on the new connection is answered over IPv4, and finds it.
+    const data_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, cookie_syn_ack.seq +% 1, .{ .ack = true, .psh = true }, 65535, "hi", &pkt_buf);
+    _ = stack.injectPacket(30, pkt_buf[0..data_len]);
+    var data: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), stack.read(v4_idx, &data));
+    _ = stack.poll(600); // the ACK is delayed; this sends it
+    const reply = link_ep.readOutbound(&out_buf) orelse return error.NoAck;
+    try testing.expect(parseTcp6FromRaw(reply) == null);
+    try testing.expectEqual(@as(u16, 6000), parseTcpFromRaw(reply).?.dst_port);
 }
 
 test "FullStack: accepting a held SYN does not fall back to a cookie" {
