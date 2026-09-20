@@ -16,6 +16,7 @@ const receiver_mod = @import("receiver.zig");
 const timer_mod = @import("timer.zig");
 const options_mod = @import("options.zig");
 const congestion_mod = @import("congestion.zig");
+const rtt_mod = @import("rtt.zig");
 const config_mod = @import("../../config.zig");
 pub const Config = config_mod.Config;
 
@@ -737,11 +738,18 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 self.ts_recent_age = now_ms;
             }
 
-            // RTT from echoed timestamp
+            // RTT from echoed timestamp. TSecr is what the peer echoed of our
+            // TSval, which is the clock truncated to 32 bits, so the sample
+            // has to be taken in that same 32-bit space: subtracting it from
+            // the full clock gives the age of the machine once that clock
+            // passes 2^32 ms (49.7 days of uptime), not the round trip.
             if (tsecr != 0) {
-                const rtt_sample = now_ms -| @as(u64, tsecr);
-                if (rtt_sample > 0) {
-                    self.sender.rtt.update(rtt_sample);
+                const sample = self.currentTsval(now_ms) -% tsecr;
+                // A round trip longer than the maximum RTO is not a round trip
+                // we can learn anything from: a stale echo, a peer with a
+                // different idea of the clock, or our own wrap.
+                if (sample > 0 and sample <= rtt_mod.max_sample_ms) {
+                    self.sender.rtt.update(sample);
                 }
             }
         }
@@ -1109,6 +1117,39 @@ test "Connection: window scaling full round-trip" {
     const our_raw = client.receiver.windowRaw();
     // our_wire << 7 should be ≤ our_raw (due to truncation)
     try testing.expect(@as(u32, our_wire) << 7 <= our_raw);
+}
+
+test "Connection: the echoed timestamp is read on the clock that wrote it" {
+    // A machine up for 98 days: the millisecond clock is past 2^32, and the
+    // TSval on the wire is its low 32 bits. Subtracting that from the full
+    // clock gave the age of the machine as the round trip, which the RTT
+    // estimator then tried to turn into an RTO and overflowed on.
+    const uptime_ms: u64 = 98 * 24 * 60 * 60 * 1000;
+    var conn = Connection.connect(5000, 80, 1000);
+    conn.timestamps_enabled = true;
+
+    const sent_at = uptime_ms - 120;
+    conn.processTimestamp(uptime_ms, 7777, conn.currentTsval(sent_at));
+
+    try testing.expectEqual(@as(u32, 120), conn.sender.rtt.srtt.?);
+    try testing.expect(conn.sender.rtt.rto <= 60_000);
+
+    // And across the wrap itself: the echo was written just before the clock
+    // passed 2^32, the ACK arrives just after.
+    var wrapped = Connection.connect(5001, 80, 1000);
+    wrapped.timestamps_enabled = true;
+    const at_wrap: u64 = @as(u64, 1) << 32;
+    wrapped.processTimestamp(at_wrap + 30, 8888, wrapped.currentTsval(at_wrap - 90));
+    try testing.expectEqual(@as(u32, 120), wrapped.sender.rtt.srtt.?);
+}
+
+test "Connection: an echo nothing could have measured is left alone" {
+    var conn = Connection.connect(5000, 80, 1000);
+    conn.timestamps_enabled = true;
+    conn.processTimestamp(1_000_000, 100, conn.currentTsval(500));
+    // Older than any round trip worth believing: no sample taken.
+    try testing.expect(conn.sender.rtt.srtt == null);
+    try testing.expectEqual(@as(u32, 1000), conn.sender.rtt.rto);
 }
 
 test "Connection: PAWS rejects old timestamp" {
