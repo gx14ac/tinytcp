@@ -67,7 +67,6 @@ pub const LingerOpt = struct {
     timeout_ms: u64 = 0,
 };
 
-
 /// TCP Socket — stream-oriented connection socket.
 pub const TcpSocket = struct {
     /// Internal connection index in FullStack.

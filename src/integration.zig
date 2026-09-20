@@ -176,11 +176,13 @@ pub fn TunnelStack(comptime max_conns: usize, comptime max_flows: usize) type {
 
         fn mapEvent(_: *Self, ev: full_stack_mod.Event) TunnelEvent {
             return switch (ev) {
-                .accepted => |idx| .{ .tcp_accepted = .{
-                    .conn_idx = idx,
-                    .remote_addr = .{ 0, 0, 0, 0 }, // caller looks up via connId
-                    .remote_port = 0,
-                } },
+                .accepted => |idx| .{
+                    .tcp_accepted = .{
+                        .conn_idx = idx,
+                        .remote_addr = .{ 0, 0, 0, 0 }, // caller looks up via connId
+                        .remote_port = 0,
+                    },
+                },
                 .data_ready => |idx| .{ .tcp_data_ready = idx },
                 .established => .none,
                 .closed => |idx| .{ .tcp_closed = idx },

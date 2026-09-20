@@ -26,7 +26,6 @@ const Controller = congestion_mod.Controller;
 const Bbr = bbr_mod.Bbr;
 const Timer = timer_mod.Timer;
 
-
 /// A segment in the retransmission queue.
 pub const RetxSegment = struct {
     /// Sequence number of the first byte in this segment.
@@ -170,448 +169,448 @@ pub fn SenderWith(comptime cfg: Config) type {
             };
         }
 
-    /// Available send window (min of cwnd and rwnd minus in-flight).
-    pub fn availableWindow(self: *const Self) usize {
-        const cwnd = self.congestion.window();
-        if (cwnd <= self.flight_size) return 0;
-        return cwnd - self.flight_size;
-    }
-
-    /// How many bytes we can send right now.
-    /// Implements sender-side SWS avoidance (RFC 1122 4.2.3.4):
-    /// only send if window >= min(MSS, 1/2 max_window) or all data fits.
-    pub fn canSend(self: *const Self, send_buf_pending: usize) usize {
-        const window = self.availableWindow();
-        if (window == 0) return 0;
-        // SWS avoidance: don't send into a tiny window unless it's all we have
-        const threshold = @min(@as(usize, self.mss), self.congestion.window() / 2);
-        if (window < threshold and send_buf_pending > window) {
-            return 0;
-        }
-        return @min(window, send_buf_pending);
-    }
-
-    /// Generate the next segment to send (if any).
-    /// `send_buf_pending`: total unsent bytes in the application send buffer.
-    /// `has_fin`: whether the application has requested close.
-    /// Returns an EmitAction describing what to send.
-    pub fn poll(self: *Self, now_ms: u64, send_buf_pending: usize, has_fin: bool) EmitAction {
-        // Check timer expiry
-        if (self.timer.shouldFire(now_ms)) {
-            return self.handleTimerExpiry(now_ms);
+        /// Available send window (min of cwnd and rwnd minus in-flight).
+        pub fn availableWindow(self: *const Self) usize {
+            const cwnd = self.congestion.window();
+            if (cwnd <= self.flight_size) return 0;
+            return cwnd - self.flight_size;
         }
 
-        // If SYN not yet sent
-        if (!self.syn_sent) {
-            self.syn_sent = true;
-            const bbr_state = self.getBbrSendState();
-            self.snd_nxt +%= 1; // SYN consumes 1 seq
-            self.congestion.onSend(1);
-            self.enqueue(.{
-                .seq = self.iss,
-                .len = 1,
-                .sent_at = now_ms,
-                .is_syn = true,
-                .bbr_delivered = bbr_state.delivered,
-                .bbr_delivered_time = bbr_state.delivered_time,
-            });
-            self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
-            self.rtt.startSample(now_ms, self.iss);
-            return .{ .send_syn = .{ .seq = self.iss } };
+        /// How many bytes we can send right now.
+        /// Implements sender-side SWS avoidance (RFC 1122 4.2.3.4):
+        /// only send if window >= min(MSS, 1/2 max_window) or all data fits.
+        pub fn canSend(self: *const Self, send_buf_pending: usize) usize {
+            const window = self.availableWindow();
+            if (window == 0) return 0;
+            // SWS avoidance: don't send into a tiny window unless it's all we have
+            const threshold = @min(@as(usize, self.mss), self.congestion.window() / 2);
+            if (window < threshold and send_buf_pending > window) {
+                return 0;
+            }
+            return @min(window, send_buf_pending);
         }
 
-        // SYN must be acked before sending data
-        if (!self.syn_acked) return .none;
-
-        // Try to send data
-        const available = self.canSend(send_buf_pending);
-        if (available > 0) {
-            const seg_len = @min(available, @as(usize, self.mss));
-
-            // Nagle: don't send small segments if there's unacked data
-            if (self.nagle_enabled and seg_len < self.mss and self.flight_size > 0) {
-                // Exception: if this is all remaining data
-                if (seg_len < send_buf_pending) {
-                    return .none;
-                }
+        /// Generate the next segment to send (if any).
+        /// `send_buf_pending`: total unsent bytes in the application send buffer.
+        /// `has_fin`: whether the application has requested close.
+        /// Returns an EmitAction describing what to send.
+        pub fn poll(self: *Self, now_ms: u64, send_buf_pending: usize, has_fin: bool) EmitAction {
+            // Check timer expiry
+            if (self.timer.shouldFire(now_ms)) {
+                return self.handleTimerExpiry(now_ms);
             }
 
-            const seq = self.snd_nxt;
-            const buf_offset = self.flightDataSize();
+            // If SYN not yet sent
+            if (!self.syn_sent) {
+                self.syn_sent = true;
+                const bbr_state = self.getBbrSendState();
+                self.snd_nxt +%= 1; // SYN consumes 1 seq
+                self.congestion.onSend(1);
+                self.enqueue(.{
+                    .seq = self.iss,
+                    .len = 1,
+                    .sent_at = now_ms,
+                    .is_syn = true,
+                    .bbr_delivered = bbr_state.delivered,
+                    .bbr_delivered_time = bbr_state.delivered_time,
+                });
+                self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
+                self.rtt.startSample(now_ms, self.iss);
+                return .{ .send_syn = .{ .seq = self.iss } };
+            }
 
-            // Capture BBR per-packet state before updating
-            const bbr_state = self.getBbrSendState();
+            // SYN must be acked before sending data
+            if (!self.syn_acked) return .none;
 
-            self.snd_nxt +%= @intCast(seg_len);
-            self.flight_size += seg_len;
-            self.congestion.onSend(seg_len);
+            // Try to send data
+            const available = self.canSend(send_buf_pending);
+            if (available > 0) {
+                const seg_len = @min(available, @as(usize, self.mss));
 
-            self.enqueue(.{
-                .seq = seq,
-                .len = @intCast(seg_len),
-                .sent_at = now_ms,
-                .buf_offset = buf_offset,
-                .data_len = seg_len,
-                .bbr_delivered = bbr_state.delivered,
-                .bbr_delivered_time = bbr_state.delivered_time,
-            });
+                // Nagle: don't send small segments if there's unacked data
+                if (self.nagle_enabled and seg_len < self.mss and self.flight_size > 0) {
+                    // Exception: if this is all remaining data
+                    if (seg_len < send_buf_pending) {
+                        return .none;
+                    }
+                }
 
-            // Start RTT sampling if not already
-            self.rtt.startSample(now_ms, seq);
+                const seq = self.snd_nxt;
+                const buf_offset = self.flightDataSize();
 
-            // Arm retransmit timer
-            self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
+                // Capture BBR per-packet state before updating
+                const bbr_state = self.getBbrSendState();
 
-            return .{ .send_data = .{
-                .seq = seq,
-                .buf_offset = buf_offset,
-                .data_len = seg_len,
-            } };
+                self.snd_nxt +%= @intCast(seg_len);
+                self.flight_size += seg_len;
+                self.congestion.onSend(seg_len);
+
+                self.enqueue(.{
+                    .seq = seq,
+                    .len = @intCast(seg_len),
+                    .sent_at = now_ms,
+                    .buf_offset = buf_offset,
+                    .data_len = seg_len,
+                    .bbr_delivered = bbr_state.delivered,
+                    .bbr_delivered_time = bbr_state.delivered_time,
+                });
+
+                // Start RTT sampling if not already
+                self.rtt.startSample(now_ms, seq);
+
+                // Arm retransmit timer
+                self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
+
+                return .{ .send_data = .{
+                    .seq = seq,
+                    .buf_offset = buf_offset,
+                    .data_len = seg_len,
+                } };
+            }
+
+            // FIN
+            if (has_fin and !self.fin_sent and send_buf_pending == 0) {
+                self.fin_sent = true;
+                const seq = self.snd_nxt;
+                const bbr_state = self.getBbrSendState();
+                self.snd_nxt +%= 1;
+                self.congestion.onSend(1);
+
+                self.enqueue(.{
+                    .seq = seq,
+                    .len = 1,
+                    .sent_at = now_ms,
+                    .is_fin = true,
+                    .bbr_delivered = bbr_state.delivered,
+                    .bbr_delivered_time = bbr_state.delivered_time,
+                });
+                self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
+                return .{ .send_fin = .{ .seq = seq } };
+            }
+
+            return .none;
         }
 
-        // FIN
-        if (has_fin and !self.fin_sent and send_buf_pending == 0) {
-            self.fin_sent = true;
-            const seq = self.snd_nxt;
-            const bbr_state = self.getBbrSendState();
-            self.snd_nxt +%= 1;
-            self.congestion.onSend(1);
+        /// Process an incoming ACK.
+        /// Returns the number of data bytes acknowledged (for buffer consumption).
+        pub fn onAck(self: *Self, now_ms: u64, ack_seq: u32) usize {
+            // Ignore old/duplicate ACKs
+            if (!endpoint_mod.seqGt(ack_seq, self.snd_una)) {
+                // Duplicate ACK
+                if (ack_seq == self.last_ack_seq and self.flight_size > 0) {
+                    self.dup_ack_count +|= 1;
+                    if (self.dup_ack_count == 3 and !self.in_fast_recovery) {
+                        // Enter Fast Recovery (RFC 6582)
+                        self.in_fast_recovery = true;
+                        self.recovery_point = self.snd_nxt;
+                        self.congestion.onDuplicateAck();
+                        self.timer.setFastRetransmit();
+                    } else if (self.dup_ack_count > 3 and self.in_fast_recovery) {
+                        // Each additional dup-ACK inflates cwnd by MSS
+                        self.congestion.inflateCwnd();
+                    }
+                }
+                return 0;
+            }
 
-            self.enqueue(.{
-                .seq = seq,
-                .len = 1,
-                .sent_at = now_ms,
-                .is_fin = true,
-                .bbr_delivered = bbr_state.delivered,
-                .bbr_delivered_time = bbr_state.delivered_time,
-            });
-            self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
-            return .{ .send_fin = .{ .seq = seq } };
-        }
+            // New ACK — update dup-ACK tracking
+            self.dup_ack_count = 0;
+            self.last_ack_seq = ack_seq;
 
-        return .none;
-    }
+            // Update RTT
+            self.rtt.onAck(now_ms, ack_seq);
 
-    /// Process an incoming ACK.
-    /// Returns the number of data bytes acknowledged (for buffer consumption).
-    pub fn onAck(self: *Self, now_ms: u64, ack_seq: u32) usize {
-        // Ignore old/duplicate ACKs
-        if (!endpoint_mod.seqGt(ack_seq, self.snd_una)) {
-            // Duplicate ACK
-            if (ack_seq == self.last_ack_seq and self.flight_size > 0) {
-                self.dup_ack_count +|= 1;
-                if (self.dup_ack_count == 3 and !self.in_fast_recovery) {
-                    // Enter Fast Recovery (RFC 6582)
-                    self.in_fast_recovery = true;
-                    self.recovery_point = self.snd_nxt;
-                    self.congestion.onDuplicateAck();
+            // Dequeue acknowledged segments and update RACK
+            var data_acked: usize = 0;
+            var last_bbr_delivered: u64 = 0;
+            var last_bbr_delivered_time: u64 = 0;
+            var last_rtt_ms: u64 = 0;
+            while (self.retx_count > 0) {
+                const seg = self.peekHead() orelse break;
+                const seg_end = seg.seq +% seg.len;
+                if (!endpoint_mod.seqLte(seg_end, ack_seq)) break;
+
+                // Update RACK with this ACKed segment's send time
+                if (!seg.retransmitted) {
+                    self.rack.update(seg.sent_at, now_ms);
+                    // Compute RTT for BBR (only from non-retransmitted segments)
+                    last_rtt_ms = now_ms -| seg.sent_at;
+                }
+
+                // Track per-packet BBR state for the most recent ACKed segment
+                last_bbr_delivered = seg.bbr_delivered;
+                last_bbr_delivered_time = seg.bbr_delivered_time;
+
+                // This segment is fully acked
+                if (seg.is_syn) {
+                    self.syn_acked = true;
+                } else if (seg.is_fin) {
+                    self.fin_acked = true;
+                } else {
+                    data_acked += seg.data_len;
+                }
+                self.dequeue();
+            }
+
+            // Update flight size
+            if (data_acked <= self.flight_size) {
+                self.flight_size -= data_acked;
+            } else {
+                self.flight_size = 0;
+            }
+
+            // Update snd_una
+            self.snd_una = ack_seq;
+
+            // Fast Recovery (NewReno) handling
+            if (self.in_fast_recovery) {
+                if (endpoint_mod.seqGte(ack_seq, self.recovery_point)) {
+                    // Full ACK: exit Fast Recovery, cwnd = ssthresh
+                    self.in_fast_recovery = false;
+                    self.congestion.deflateCwnd();
+                } else {
+                    // Partial ACK (RFC 6582 §3.2): deflate by acked, add MSS, retransmit
+                    self.congestion.onPartialAck(data_acked);
                     self.timer.setFastRetransmit();
-                } else if (self.dup_ack_count > 3 and self.in_fast_recovery) {
-                    // Each additional dup-ACK inflates cwnd by MSS
-                    self.congestion.inflateCwnd();
                 }
-            }
-            return 0;
-        }
-
-        // New ACK — update dup-ACK tracking
-        self.dup_ack_count = 0;
-        self.last_ack_seq = ack_seq;
-
-        // Update RTT
-        self.rtt.onAck(now_ms, ack_seq);
-
-        // Dequeue acknowledged segments and update RACK
-        var data_acked: usize = 0;
-        var last_bbr_delivered: u64 = 0;
-        var last_bbr_delivered_time: u64 = 0;
-        var last_rtt_ms: u64 = 0;
-        while (self.retx_count > 0) {
-            const seg = self.peekHead() orelse break;
-            const seg_end = seg.seq +% seg.len;
-            if (!endpoint_mod.seqLte(seg_end, ack_seq)) break;
-
-            // Update RACK with this ACKed segment's send time
-            if (!seg.retransmitted) {
-                self.rack.update(seg.sent_at, now_ms);
-                // Compute RTT for BBR (only from non-retransmitted segments)
-                last_rtt_ms = now_ms -| seg.sent_at;
+            } else if (data_acked > 0) {
+                // Use BBR-aware ACK with per-packet delivery state and RTT
+                self.congestion.onAckBbr(now_ms, data_acked, last_bbr_delivered, last_bbr_delivered_time, last_rtt_ms);
             }
 
-            // Track per-packet BBR state for the most recent ACKed segment
-            last_bbr_delivered = seg.bbr_delivered;
-            last_bbr_delivered_time = seg.bbr_delivered_time;
+            // RACK: check remaining segments for time-based loss
+            self.rackDetectLosses(now_ms);
 
-            // This segment is fully acked
-            if (seg.is_syn) {
-                self.syn_acked = true;
-            } else if (seg.is_fin) {
-                self.fin_acked = true;
+            // If everything is acked, stop the timer
+            if (self.retx_count == 0) {
+                self.timer.onAck();
             } else {
-                data_acked += seg.data_len;
+                // Reset timer for remaining segments
+                self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
             }
-            self.dequeue();
+
+            return data_acked;
         }
 
-        // Update flight size
-        if (data_acked <= self.flight_size) {
-            self.flight_size -= data_acked;
-        } else {
-            self.flight_size = 0;
-        }
+        /// RACK: detect losses based on time rather than dup-ACK counting.
+        fn rackDetectLosses(self: *Self, now_ms: u64) void {
+            if (!self.rack.active) return;
 
-        // Update snd_una
-        self.snd_una = ack_seq;
-
-        // Fast Recovery (NewReno) handling
-        if (self.in_fast_recovery) {
-            if (endpoint_mod.seqGte(ack_seq, self.recovery_point)) {
-                // Full ACK: exit Fast Recovery, cwnd = ssthresh
-                self.in_fast_recovery = false;
-                self.congestion.deflateCwnd();
-            } else {
-                // Partial ACK (RFC 6582 §3.2): deflate by acked, add MSS, retransmit
-                self.congestion.onPartialAck(data_acked);
-                self.timer.setFastRetransmit();
-            }
-        } else if (data_acked > 0) {
-            // Use BBR-aware ACK with per-packet delivery state and RTT
-            self.congestion.onAckBbr(now_ms, data_acked, last_bbr_delivered, last_bbr_delivered_time, last_rtt_ms);
-        }
-
-        // RACK: check remaining segments for time-based loss
-        self.rackDetectLosses(now_ms);
-
-        // If everything is acked, stop the timer
-        if (self.retx_count == 0) {
-            self.timer.onAck();
-        } else {
-            // Reset timer for remaining segments
-            self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
-        }
-
-        return data_acked;
-    }
-
-    /// RACK: detect losses based on time rather than dup-ACK counting.
-    fn rackDetectLosses(self: *Self, now_ms: u64) void {
-        if (!self.rack.active) return;
-
-        var i: usize = 0;
-        var idx = self.retx_head;
-        var found_loss = false;
-        while (i < self.retx_count) : (i += 1) {
-            const seg = &self.retx_queue[idx];
-            if (!seg.sacked and !seg.retransmitted) {
-                if (self.rack.isLost(seg.sent_at, now_ms)) {
-                    found_loss = true;
-                    break;
-                }
-            }
-            idx = (idx + 1) % retx_queue_size;
-        }
-
-        if (found_loss) {
-            self.congestion.onDuplicateAck();
-            self.timer.setFastRetransmit();
-        }
-    }
-
-    /// Handle a timer expiry. Called from poll() when timer fires.
-    fn handleTimerExpiry(self: *Self, now_ms: u64) EmitAction {
-        switch (self.timer) {
-            .retransmit => {
-                // Retransmission timeout — exit Fast Recovery if active
-                self.rtt.onRetransmit();
-                self.congestion.onRetransmit();
-                self.dup_ack_count = 0;
-                self.in_fast_recovery = false;
-
-                // Check if we've exceeded max retransmits
-                const aborted = self.timer.onRetransmitTimeout(now_ms, self.rtt.rtoMs());
-                if (aborted) return .abort;
-
-                // Retransmit the first un-SACKed segment
-                if (self.firstUnsackedSeg()) |seg| {
-                    self.markRetransmitted(seg.seq);
-
-                    if (seg.is_syn) {
-                        return .{ .send_syn = .{ .seq = seg.seq } };
-                    } else if (seg.is_fin) {
-                        return .{ .send_fin = .{ .seq = seg.seq } };
-                    } else {
-                        return .{ .send_data = .{
-                            .seq = seg.seq,
-                            .buf_offset = seg.buf_offset,
-                            .data_len = seg.data_len,
-                        } };
-                    }
-                }
-                return .none;
-            },
-            .fast_retransmit => {
-                // Retransmit the first un-SACKed segment immediately
-                if (self.firstUnsackedSeg()) |seg| {
-                    self.markRetransmitted(seg.seq);
-                    self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
-
-                    if (seg.is_syn) {
-                        return .{ .send_syn = .{ .seq = seg.seq } };
-                    } else if (seg.is_fin) {
-                        return .{ .send_fin = .{ .seq = seg.seq } };
-                    } else {
-                        return .{ .send_data = .{
-                            .seq = seg.seq,
-                            .buf_offset = seg.buf_offset,
-                            .data_len = seg.data_len,
-                        } };
-                    }
-                }
-                self.timer.reset();
-                return .none;
-            },
-            .zero_window_probe => {
-                // Send a 1-byte probe
-                self.timer.setZeroWindowProbe(now_ms, self.rtt.rtoMs());
-                return .none; // Caller handles zero-window probe
-            },
-            .idle => {
-                // Keepalive (handled by caller)
-                return .none;
-            },
-            .delayed_ack => {
-                // Delayed ACK expired — caller should send ACK
-                self.timer.reset();
-                return .none;
-            },
-            .time_wait => {
-                return .none;
-            },
-        }
-    }
-
-    /// Set remote window (from received segment, after applying window scale).
-    pub fn setRemoteWindow(self: *Self, rwnd: u32) void {
-        self.congestion.setRemoteWindow(@as(usize, rwnd));
-    }
-
-    /// Process incoming SACK blocks from peer.
-    /// Marks segments in retx queue as SACKed so they are skipped on retransmit.
-    /// Also updates RACK state with newly SACKed segments.
-    pub fn onSackBlocks(self: *Self, now_ms: u64, blocks: []const options_mod.SackBlock) void {
-        for (blocks) |block| {
             var i: usize = 0;
             var idx = self.retx_head;
+            var found_loss = false;
             while (i < self.retx_count) : (i += 1) {
                 const seg = &self.retx_queue[idx];
-                if (!seg.sacked and !seg.is_syn and !seg.is_fin) {
-                    const seg_end = seg.seq +% seg.len;
-                    if (endpoint_mod.seqLte(block.left, seg.seq) and endpoint_mod.seqLte(seg_end, block.right)) {
-                        seg.sacked = true;
-                        // RACK: update with this SACKed segment
-                        if (!seg.retransmitted) {
-                            self.rack.update(seg.sent_at, now_ms);
-                        }
+                if (!seg.sacked and !seg.retransmitted) {
+                    if (self.rack.isLost(seg.sent_at, now_ms)) {
+                        found_loss = true;
+                        break;
                     }
                 }
                 idx = (idx + 1) % retx_queue_size;
             }
-        }
-        // After processing SACK blocks, check for RACK losses
-        self.rackDetectLosses(now_ms);
-    }
 
-    /// Find the first un-SACKed segment for retransmission (skips SACKed).
-    fn firstUnsackedSeg(self: *const Self) ?RetxSegment {
-        var i: usize = 0;
-        var idx = self.retx_head;
-        while (i < self.retx_count) : (i += 1) {
-            const seg = self.retx_queue[idx];
-            if (!seg.sacked) return seg;
-            idx = (idx + 1) % retx_queue_size;
-        }
-        return null;
-    }
-
-    /// Set MSS (from options negotiation).
-    pub fn setMss(self: *Self, mss: u16) void {
-        self.mss = mss;
-        self.congestion.setMss(mss);
-    }
-
-    /// Get the next poll deadline (for event loop).
-    pub fn nextPollAt(self: *const Self) ?u64 {
-        return self.timer.nextPollAt();
-    }
-
-    // -- Internal ring buffer operations --
-
-    fn enqueue(self: *Self, seg: RetxSegment) void {
-        if (self.retx_count >= retx_queue_size) {
-            // Queue full — drop oldest (shouldn't happen in practice)
-            self.dequeue();
-        }
-        self.retx_queue[self.retx_tail] = seg;
-        self.retx_tail = (self.retx_tail + 1) % retx_queue_size;
-        self.retx_count += 1;
-    }
-
-    fn dequeue(self: *Self) void {
-        if (self.retx_count == 0) return;
-        self.retx_head = (self.retx_head + 1) % retx_queue_size;
-        self.retx_count -= 1;
-    }
-
-    fn peekHead(self: *const Self) ?RetxSegment {
-        if (self.retx_count == 0) return null;
-        return self.retx_queue[self.retx_head];
-    }
-
-    fn updateHead(self: *Self, seg: RetxSegment) void {
-        if (self.retx_count > 0) {
-            self.retx_queue[self.retx_head] = seg;
-        }
-    }
-
-    fn markRetransmitted(self: *Self, seq: u32) void {
-        var i: usize = 0;
-        var idx = self.retx_head;
-        while (i < self.retx_count) : (i += 1) {
-            if (self.retx_queue[idx].seq == seq) {
-                self.retx_queue[idx].retransmitted = true;
-                return;
+            if (found_loss) {
+                self.congestion.onDuplicateAck();
+                self.timer.setFastRetransmit();
             }
-            idx = (idx + 1) % retx_queue_size;
         }
-    }
 
-    /// Calculate total data bytes in flight (exclude SYN/FIN virtual bytes).
-    fn flightDataSize(self: *const Self) usize {
-        var total: usize = 0;
-        var i: usize = 0;
-        var idx = self.retx_head;
-        while (i < self.retx_count) : (i += 1) {
-            total += self.retx_queue[idx].data_len;
-            idx = (idx + 1) % retx_queue_size;
-        }
-        return total;
-    }
+        /// Handle a timer expiry. Called from poll() when timer fires.
+        fn handleTimerExpiry(self: *Self, now_ms: u64) EmitAction {
+            switch (self.timer) {
+                .retransmit => {
+                    // Retransmission timeout — exit Fast Recovery if active
+                    self.rtt.onRetransmit();
+                    self.congestion.onRetransmit();
+                    self.dup_ack_count = 0;
+                    self.in_fast_recovery = false;
 
-    /// Get BBR per-packet send state snapshot from the congestion controller.
-    fn getBbrSendState(self: *const Self) bbr_mod.SendState {
-        switch (self.congestion) {
-            .bbr => |*b| return b.getSendState(),
-            else => return .{},
-        }
-    }
+                    // Check if we've exceeded max retransmits
+                    const aborted = self.timer.onRetransmitTimeout(now_ms, self.rtt.rtoMs());
+                    if (aborted) return .abort;
 
-    /// Feed an RTT sample to BBR (called externally when timestamps provide a sample).
-    pub fn updateBbrRtt(self: *Self, now_ms: u64, rtt_ms: u64) void {
-        switch (self.congestion) {
-            .bbr => |*b| b.updateRtProp(rtt_ms, now_ms),
-            else => {},
+                    // Retransmit the first un-SACKed segment
+                    if (self.firstUnsackedSeg()) |seg| {
+                        self.markRetransmitted(seg.seq);
+
+                        if (seg.is_syn) {
+                            return .{ .send_syn = .{ .seq = seg.seq } };
+                        } else if (seg.is_fin) {
+                            return .{ .send_fin = .{ .seq = seg.seq } };
+                        } else {
+                            return .{ .send_data = .{
+                                .seq = seg.seq,
+                                .buf_offset = seg.buf_offset,
+                                .data_len = seg.data_len,
+                            } };
+                        }
+                    }
+                    return .none;
+                },
+                .fast_retransmit => {
+                    // Retransmit the first un-SACKed segment immediately
+                    if (self.firstUnsackedSeg()) |seg| {
+                        self.markRetransmitted(seg.seq);
+                        self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
+
+                        if (seg.is_syn) {
+                            return .{ .send_syn = .{ .seq = seg.seq } };
+                        } else if (seg.is_fin) {
+                            return .{ .send_fin = .{ .seq = seg.seq } };
+                        } else {
+                            return .{ .send_data = .{
+                                .seq = seg.seq,
+                                .buf_offset = seg.buf_offset,
+                                .data_len = seg.data_len,
+                            } };
+                        }
+                    }
+                    self.timer.reset();
+                    return .none;
+                },
+                .zero_window_probe => {
+                    // Send a 1-byte probe
+                    self.timer.setZeroWindowProbe(now_ms, self.rtt.rtoMs());
+                    return .none; // Caller handles zero-window probe
+                },
+                .idle => {
+                    // Keepalive (handled by caller)
+                    return .none;
+                },
+                .delayed_ack => {
+                    // Delayed ACK expired — caller should send ACK
+                    self.timer.reset();
+                    return .none;
+                },
+                .time_wait => {
+                    return .none;
+                },
+            }
         }
-    }
+
+        /// Set remote window (from received segment, after applying window scale).
+        pub fn setRemoteWindow(self: *Self, rwnd: u32) void {
+            self.congestion.setRemoteWindow(@as(usize, rwnd));
+        }
+
+        /// Process incoming SACK blocks from peer.
+        /// Marks segments in retx queue as SACKed so they are skipped on retransmit.
+        /// Also updates RACK state with newly SACKed segments.
+        pub fn onSackBlocks(self: *Self, now_ms: u64, blocks: []const options_mod.SackBlock) void {
+            for (blocks) |block| {
+                var i: usize = 0;
+                var idx = self.retx_head;
+                while (i < self.retx_count) : (i += 1) {
+                    const seg = &self.retx_queue[idx];
+                    if (!seg.sacked and !seg.is_syn and !seg.is_fin) {
+                        const seg_end = seg.seq +% seg.len;
+                        if (endpoint_mod.seqLte(block.left, seg.seq) and endpoint_mod.seqLte(seg_end, block.right)) {
+                            seg.sacked = true;
+                            // RACK: update with this SACKed segment
+                            if (!seg.retransmitted) {
+                                self.rack.update(seg.sent_at, now_ms);
+                            }
+                        }
+                    }
+                    idx = (idx + 1) % retx_queue_size;
+                }
+            }
+            // After processing SACK blocks, check for RACK losses
+            self.rackDetectLosses(now_ms);
+        }
+
+        /// Find the first un-SACKed segment for retransmission (skips SACKed).
+        fn firstUnsackedSeg(self: *const Self) ?RetxSegment {
+            var i: usize = 0;
+            var idx = self.retx_head;
+            while (i < self.retx_count) : (i += 1) {
+                const seg = self.retx_queue[idx];
+                if (!seg.sacked) return seg;
+                idx = (idx + 1) % retx_queue_size;
+            }
+            return null;
+        }
+
+        /// Set MSS (from options negotiation).
+        pub fn setMss(self: *Self, mss: u16) void {
+            self.mss = mss;
+            self.congestion.setMss(mss);
+        }
+
+        /// Get the next poll deadline (for event loop).
+        pub fn nextPollAt(self: *const Self) ?u64 {
+            return self.timer.nextPollAt();
+        }
+
+        // -- Internal ring buffer operations --
+
+        fn enqueue(self: *Self, seg: RetxSegment) void {
+            if (self.retx_count >= retx_queue_size) {
+                // Queue full — drop oldest (shouldn't happen in practice)
+                self.dequeue();
+            }
+            self.retx_queue[self.retx_tail] = seg;
+            self.retx_tail = (self.retx_tail + 1) % retx_queue_size;
+            self.retx_count += 1;
+        }
+
+        fn dequeue(self: *Self) void {
+            if (self.retx_count == 0) return;
+            self.retx_head = (self.retx_head + 1) % retx_queue_size;
+            self.retx_count -= 1;
+        }
+
+        fn peekHead(self: *const Self) ?RetxSegment {
+            if (self.retx_count == 0) return null;
+            return self.retx_queue[self.retx_head];
+        }
+
+        fn updateHead(self: *Self, seg: RetxSegment) void {
+            if (self.retx_count > 0) {
+                self.retx_queue[self.retx_head] = seg;
+            }
+        }
+
+        fn markRetransmitted(self: *Self, seq: u32) void {
+            var i: usize = 0;
+            var idx = self.retx_head;
+            while (i < self.retx_count) : (i += 1) {
+                if (self.retx_queue[idx].seq == seq) {
+                    self.retx_queue[idx].retransmitted = true;
+                    return;
+                }
+                idx = (idx + 1) % retx_queue_size;
+            }
+        }
+
+        /// Calculate total data bytes in flight (exclude SYN/FIN virtual bytes).
+        fn flightDataSize(self: *const Self) usize {
+            var total: usize = 0;
+            var i: usize = 0;
+            var idx = self.retx_head;
+            while (i < self.retx_count) : (i += 1) {
+                total += self.retx_queue[idx].data_len;
+                idx = (idx + 1) % retx_queue_size;
+            }
+            return total;
+        }
+
+        /// Get BBR per-packet send state snapshot from the congestion controller.
+        fn getBbrSendState(self: *const Self) bbr_mod.SendState {
+            switch (self.congestion) {
+                .bbr => |*b| return b.getSendState(),
+                else => return .{},
+            }
+        }
+
+        /// Feed an RTT sample to BBR (called externally when timestamps provide a sample).
+        pub fn updateBbrRtt(self: *Self, now_ms: u64, rtt_ms: u64) void {
+            switch (self.congestion) {
+                .bbr => |*b| b.updateRtProp(rtt_ms, now_ms),
+                else => {},
+            }
+        }
     };
 }
 
