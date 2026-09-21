@@ -389,6 +389,18 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
                     return .none;
                 },
+                // Our FIN is on the wire and the peer has not acknowledged
+                // everything before it, so what is still in flight is still
+                // ours to retransmit. Nothing new leaves from here: write()
+                // stops at established and close_wait, so there is nothing
+                // unsent, and the FIN the sender knows about is the one
+                // already sent. Without this the sender is never asked
+                // anything in these states — an unacked segment is dropped
+                // on the floor, and a fast retransmit asked for here is
+                // never served while nextPollAt keeps saying "poll me now".
+                .fin_wait_1, .closing, .last_ack => {
+                    return self.senderActionToOutput(self.sender.poll(now_ms, 0, false));
+                },
                 .time_wait => {
                     if (self.sender.timer.shouldFire(now_ms)) {
                         self.state = .closed;
@@ -1624,4 +1636,49 @@ test "Connection: a partial ACK's fast retransmit is not written over" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "Connection: data still unacked when the FIN goes out is retransmitted" {
+    var conn = makeEstablished();
+    _ = conn.write("ABCD");
+    _ = conn.poll(10); // the data
+    conn.close();
+    switch (conn.poll(11)) { // the FIN
+        .send => |seg| try testing.expect(seg.flags.fin),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+
+    // Neither is acked, so the retransmit timer fires and the data goes
+    // again. fin_wait_1 used to ask the sender nothing at all.
+    switch (conn.poll(3011)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(u32, 1001), seg.seq);
+            try testing.expectEqualSlices(u8, "ABCD", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a fast retransmit asked for after the FIN is served" {
+    var conn = makeEstablished();
+    _ = conn.write("ABCD");
+    _ = conn.poll(10);
+    conn.close();
+    _ = conn.poll(11);
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+
+    // Whatever asks for one — three duplicate ACKs, or RACK — leaves the
+    // timer holding a request that only poll() can clear, and nextPollAt
+    // answers "now" for as long as it is there. A state that never polls
+    // the sender turns that into an event loop spinning on this connection.
+    conn.sender.timer.setFastRetransmit();
+    try testing.expectEqual(@as(?u64, 0), conn.nextPollAt());
+
+    switch (conn.poll(12)) {
+        .send => |seg| try testing.expectEqualSlices(u8, "ABCD", conn.send_buf[seg.payload_offset..][0..seg.payload_len]),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(conn.sender.timer != .fast_retransmit);
+    try testing.expect(conn.nextPollAt().? > 0);
 }
