@@ -168,16 +168,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .sender = SenderT.init(isn, cfg.default_mss),
             };
             conn.applyPeerOptions(peer_opts);
-            conn.sender.syn_sent = true;
-            conn.sender.snd_nxt = isn +% 1;
-            conn.sender.snd_una = isn;
-            conn.sender.retx_queue[0] = .{
-                .seq = isn,
-                .len = 1,
-                .sent_at = now_ms,
-                .is_syn = true,
-            };
-            conn.sender.retx_count = 1;
+            conn.sender.trackSyn(isn, now_ms);
             return conn;
         }
 
@@ -317,7 +308,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     const action = self.sender.poll(now_ms, pending, has_fin);
                     switch (action) {
                         .send_data => |d| {
-                            self.send_buf_sent += d.data_len;
+                            if (!d.retransmit) self.send_buf_sent += d.data_len;
                             self.last_activity_ms = now_ms;
                             self.keepalive_probes_sent = 0;
                             return .{ .send = .{
@@ -425,6 +416,9 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     self.send_buf_sent = 0;
                 }
             }
+            // Whatever is left in flight starts that much earlier in the
+            // buffer now, and a retransmission reads it by offset.
+            self.sender.shiftBufOffsets(acked_bytes);
         }
 
         // -- State-specific handlers --
@@ -641,7 +635,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     } };
                 },
                 .send_data => |d| {
-                    self.send_buf_sent += d.data_len;
+                    if (!d.retransmit) self.send_buf_sent += d.data_len;
                     return .{ .send = .{
                         .flags = .{ .ack = true, .psh = true },
                         .seq = d.seq,
@@ -1396,4 +1390,97 @@ test "Connection: ECN CWR received clears ECE pending" {
     // Receive CWR from peer
     _ = conn.onSegment(10, .{ .ack = true, .cwr = true }, 2000, 1001, 65535, &.{});
     try testing.expect(!conn.ecn_ece_pending);
+}
+
+test "Connection: a passive open's SYN leaves the retransmit ring consistent" {
+    var conn = Connection.acceptFromSyn(80, 1000, 0, .{});
+    const ring_len = conn.sender.retx_queue.len;
+
+    // The SYN is queued like any other segment: one entry, tail one past head.
+    try testing.expectEqual(@as(usize, 1), conn.sender.retx_count);
+    try testing.expectEqual((conn.sender.retx_head + 1) % ring_len, conn.sender.retx_tail);
+
+    // Answer the SYN, then let the peer finish the handshake.
+    _ = conn.onSegment(0, .{ .syn = true }, 2000, 0, 65535, &.{});
+    _ = conn.onSegment(1, .{ .ack = true }, 2001, 1001, 65535, &.{});
+    try testing.expectEqual(State.established, conn.state);
+    try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
+    try testing.expectEqual(conn.sender.retx_tail, conn.sender.retx_head);
+
+    // Data sent after the handshake is what the queue hands back, rather
+    // than an entry nobody ever wrote.
+    try testing.expectEqual(@as(usize, 5), conn.write("hello"));
+    switch (conn.poll(2)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 5), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), conn.sender.retx_count);
+
+    // Once it is acked nothing is left to retransmit.
+    _ = conn.onSegment(3, .{ .ack = true }, 2001, 1006, 65535, &.{});
+    try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
+    try testing.expectEqual(conn.sender.retx_tail, conn.sender.retx_head);
+}
+
+test "Connection: a retransmission does not count its bytes as sent twice" {
+    var conn = makeEstablished();
+    _ = conn.write("hello world");
+    switch (conn.poll(10)) {
+        .send => |seg| try testing.expectEqual(@as(usize, 11), seg.payload_len),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 11), conn.send_buf_sent);
+
+    // No ACK arrives, so the retransmit timer fires and sends them again.
+    switch (conn.poll(1010)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 11), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Still eleven bytes handed to the sender, not twenty-two: counting them
+    // again puts sent past len and the next poll subtracts into a huge
+    // pending, which is how many bytes we then claim to send.
+    try testing.expectEqual(@as(usize, 11), conn.send_buf_sent);
+    _ = conn.poll(1011);
+}
+
+test "Connection: a retransmission after a partial ACK resends the right bytes" {
+    var conn = makeEstablished();
+    conn.sender.mss = 4;
+    _ = conn.write("ABCDEFGH");
+
+    switch (conn.poll(10)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 4), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (conn.poll(11)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 4), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 4), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The first four bytes are acked, which compacts the send buffer.
+    _ = conn.onSegment(12, .{ .ack = true }, 2000, 1005, 65535, &.{});
+    try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[0..conn.send_buf_len]);
+
+    // EFGH starts at the front of the buffer now, so that is where the
+    // retransmission has to read it from.
+    switch (conn.poll(3012)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 4), seg.payload_len);
+            try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

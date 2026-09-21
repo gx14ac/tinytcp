@@ -60,6 +60,9 @@ pub const EmitAction = union(enum) {
         seq: u32,
         buf_offset: usize,
         data_len: usize,
+        /// These bytes have been sent before, so they are already counted as
+        /// sent and in flight. Only a first transmission moves those marks.
+        retransmit: bool = false,
     },
     /// Emit a SYN segment.
     send_syn: struct {
@@ -167,6 +170,36 @@ pub fn SenderWith(comptime cfg: Config) type {
                 .mss = mss,
                 .congestion = Controller.init(.reno, mss),
             };
+        }
+
+        /// Record a SYN this side has already put on the wire so the
+        /// retransmit queue owns it like any other segment. A passive open
+        /// answers with SYN+ACK before poll() ever runs, and writing the ring
+        /// by hand there left its tail behind its count: the next segment
+        /// overwrote the SYN, and the entry the ring handed out once the data
+        /// was acked had never been written at all.
+        pub fn trackSyn(self: *Self, seq: u32, now_ms: u64) void {
+            self.syn_sent = true;
+            self.snd_una = seq;
+            self.snd_nxt = seq +% 1;
+            self.enqueue(.{
+                .seq = seq,
+                .len = 1,
+                .sent_at = now_ms,
+                .is_syn = true,
+            });
+        }
+
+        /// The send buffer compacted by `acked_bytes`, so every segment still
+        /// in the queue starts that much earlier in it. Without this a
+        /// retransmission after a partial ACK resends the wrong bytes.
+        pub fn shiftBufOffsets(self: *Self, acked_bytes: usize) void {
+            var i: usize = 0;
+            var idx = self.retx_head;
+            while (i < self.retx_count) : (i += 1) {
+                self.retx_queue[idx].buf_offset -|= acked_bytes;
+                idx = (idx + 1) % retx_queue_size;
+            }
         }
 
         /// Available send window (min of cwnd and rwnd minus in-flight).
@@ -443,6 +476,7 @@ pub fn SenderWith(comptime cfg: Config) type {
                                 .seq = seg.seq,
                                 .buf_offset = seg.buf_offset,
                                 .data_len = seg.data_len,
+                                .retransmit = true,
                             } };
                         }
                     }
@@ -463,6 +497,7 @@ pub fn SenderWith(comptime cfg: Config) type {
                                 .seq = seg.seq,
                                 .buf_offset = seg.buf_offset,
                                 .data_len = seg.data_len,
+                                .retransmit = true,
                             } };
                         }
                     }
