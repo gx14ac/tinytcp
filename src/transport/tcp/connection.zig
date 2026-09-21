@@ -254,6 +254,11 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     // Process ACKs only
                     if (flags.ack) {
                         self.processAck(now_ms, seg_ack);
+                        // The peer is done sending, not done receiving: it
+                        // keeps advertising a window, and this side keeps
+                        // sending into it. Ignoring the window here freezes
+                        // it at whatever it was when the peer half-closed.
+                        self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
                     }
                     return .none;
                 },
@@ -1509,6 +1514,42 @@ test "Connection: an ACK in close_wait still consumes the send buffer" {
         .send => |seg| {
             try testing.expectEqual(@as(usize, 4), seg.payload_len);
             try testing.expectEqualSlices(u8, "IJKL", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a window advertised in close_wait is used" {
+    var conn = makeEstablished();
+    conn.sender.mss = 4;
+    conn.sender.setMss(4);
+
+    // The peer half-closes: done sending, still receiving, and with room
+    // for four bytes.
+    _ = conn.onSegment(10, .{ .fin = true, .ack = true }, 2000, 1001, 4, &.{});
+    try testing.expectEqual(State.close_wait, conn.state);
+
+    _ = conn.write("ABCDEFGH");
+    switch (conn.poll(11)) {
+        .send => |seg| try testing.expectEqual(@as(usize, 4), seg.payload_len),
+        else => return error.TestUnexpectedResult,
+    }
+    // Its window is full until it says otherwise.
+    // Its window is full until it says otherwise. What is left to come out
+    // is the delayed ACK for the FIN, which carries no data.
+    switch (conn.poll(12)) {
+        .send => |seg| try testing.expectEqual(@as(usize, 0), seg.payload_len),
+        else => {},
+    }
+    try testing.expectEqual(Output.none, conn.poll(13));
+
+    // It makes room. A window update is a duplicate ACK, and close_wait has
+    // to read the window out of it like any other state does.
+    _ = conn.onSegment(14, .{ .ack = true }, 2001, 1001, 16, &.{});
+    switch (conn.poll(15)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(u32, 1005), seg.seq);
+            try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
         },
         else => return error.TestUnexpectedResult,
     }

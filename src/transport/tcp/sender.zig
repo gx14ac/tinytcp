@@ -180,12 +180,15 @@ pub fn SenderWith(comptime cfg: Config) type {
         /// acked had never been written at all.
         ///
         /// What this does not do is arm the retransmit timer or start an RTT
-        /// sample, because nothing would use them: poll() only drives the
-        /// sender from syn_sent and established, so a connection sitting in
-        /// syn_received never asks the timer anything. A SYN+ACK that is lost
-        /// is therefore not resent — the connection waits on the peer, which
-        /// is what it did before this queued the SYN properly, and is its own
-        /// thing to fix.
+        /// sample, because nothing would use them: poll() does not drive the
+        /// sender from syn_received, so a connection sitting there never asks
+        /// the timer anything. A SYN+ACK that is lost is therefore not
+        /// resent, and the peer cannot rescue it either — its retransmitted
+        /// SYN carries no ACK, which that state answers with nothing. The
+        /// half-open connection then holds its slot and its place in the SYN
+        /// queue until something else tears it down. That is how it behaved
+        /// before this queued the SYN properly, and it is its own thing to
+        /// fix.
         pub fn trackSyn(self: *Self, seq: u32, now_ms: u64) void {
             self.syn_sent = true;
             self.snd_una = seq;
