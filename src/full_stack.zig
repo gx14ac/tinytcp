@@ -59,8 +59,17 @@ pub const Event = union(enum) {
     /// A SYN arrived for a port registered with listenDeferred and is being
     /// held: nothing has been sent to the peer yet, and no connection state
     /// exists. The application settles it with acceptPending or
-    /// rejectPending. The payload is the pending index.
-    syn_pending: u16,
+    /// rejectPending, passing back the handle.
+    syn_pending: PendingHandle,
+};
+
+/// Names one held SYN. The slot is reused once the hold it carried is
+/// settled or expires, and the generation changes when it is, so a caller
+/// that comes back later — after dialling somewhere, say — settles its own
+/// hold or nothing at all.
+pub const PendingHandle = struct {
+    idx: u16,
+    gen: u32,
 };
 
 /// Full integrated stack with default config.
@@ -128,6 +137,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// holds what acceptConn would have been called with, so accepting it
         /// later takes exactly the path an immediate accept would have.
         pub const PendingSyn = struct {
+            /// Changes every time the slot takes a new SYN, so a handle from
+            /// a hold that has come and gone no longer names this one.
+            gen: u32 = 0,
             id: ConnId = .{ .local_addr = .{0} ** 4, .local_port = 0, .remote_addr = .{0} ** 4, .remote_port = 0 },
             peer_seq: u32 = 0,
             peer_wnd: u16 = 0,
@@ -141,6 +153,8 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         /// What a caller needs to decide whether to take the connection.
         pub const PendingInfo = struct {
+            /// Pass this back to acceptPending or rejectPending.
+            handle: PendingHandle,
             local_port: u16,
             remote_addr: [4]u8,
             remote_port: u16,
@@ -1531,15 +1545,20 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         fn holdSyn(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_wnd: u16, peer_opts: @import("transport/tcp/options.zig").NegotiatedOptions, v6: ?V6Addrs) Event {
             for (&self.pending_syns, 0..) |*ps, i| {
                 if (!ps.active or !samePeer(ps, id, v6)) continue;
+                // A retransmission of the hold we already have: the same
+                // hold, so the same handle, and whoever is settling it keeps
+                // the one they were given.
                 ps.received_ms = now_ms;
                 ps.peer_seq = peer_seq;
                 ps.peer_wnd = peer_wnd;
                 ps.peer_opts = peer_opts;
-                return .{ .syn_pending = @intCast(i) };
+                return .{ .syn_pending = .{ .idx = @intCast(i), .gen = ps.gen } };
             }
             for (&self.pending_syns, 0..) |*ps, i| {
                 if (ps.active) continue;
+                const gen = ps.gen +% 1;
                 ps.* = .{
+                    .gen = gen,
                     .id = id,
                     .peer_seq = peer_seq,
                     .peer_wnd = peer_wnd,
@@ -1550,7 +1569,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     .local_addr6 = if (v6) |a| a.local else .{0} ** 16,
                     .remote_addr6 = if (v6) |a| a.remote else .{0} ** 16,
                 };
-                return .{ .syn_pending = @intCast(i) };
+                return .{ .syn_pending = .{ .idx = @intCast(i), .gen = gen } };
             }
             return .none;
         }
@@ -1571,13 +1590,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         /// The oldest SYN still waiting for an answer, or null.
-        pub fn nextPendingSyn(self: *const Self) ?u16 {
-            var best: ?u16 = null;
+        pub fn nextPendingSyn(self: *const Self) ?PendingHandle {
+            var best: ?PendingHandle = null;
             var best_ms: u64 = 0;
             for (self.pending_syns, 0..) |ps, i| {
                 if (!ps.active) continue;
                 if (best == null or ps.received_ms < best_ms) {
-                    best = @intCast(i);
+                    best = .{ .idx = @intCast(i), .gen = ps.gen };
                     best_ms = ps.received_ms;
                 }
             }
@@ -1590,6 +1609,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             const ps = self.pending_syns[pending_idx];
             if (!ps.active) return null;
             return .{
+                .handle = .{ .idx = pending_idx, .gen = ps.gen },
                 .local_port = ps.id.local_port,
                 .remote_addr = ps.id.remote_addr,
                 .remote_port = ps.id.remote_port,
@@ -1627,12 +1647,10 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// stopped listening. Nothing is sent in those cases: the peer
         /// retransmits, as it would have all along, and lands back in the
         /// pending table for the application to try again.
-        pub fn acceptPending(self: *Self, pending_idx: u16, now_ms: u64) ?u16 {
-            if (pending_idx >= max_pending_syns) return null;
-            const ps = self.pending_syns[pending_idx];
-            if (!ps.active) return null;
+        pub fn acceptPending(self: *Self, handle: PendingHandle, now_ms: u64) ?u16 {
+            const ps = self.heldBy(handle) orelse return null;
             if (!self.isListening(ps.id.local_port)) return null;
-            self.pending_syns[pending_idx].active = false;
+            self.pending_syns[handle.idx].active = false;
 
             const v6: ?V6Addrs = if (ps.is_v6)
                 .{ .local = ps.local_addr6, .remote = ps.remote_addr6 }
@@ -1646,12 +1664,27 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         /// Refuse a held SYN: the peer is told there is nothing here, rather
         /// than left waiting on an answer that will not come.
-        pub fn rejectPending(self: *Self, pending_idx: u16) void {
-            if (pending_idx >= max_pending_syns) return;
-            const ps = &self.pending_syns[pending_idx];
-            if (!ps.active) return;
-            self.rstPending(ps);
-            ps.active = false;
+        pub fn rejectPending(self: *Self, handle: PendingHandle) void {
+            const held = self.heldBy(handle) orelse return;
+            self.rstPending(&held);
+            self.pending_syns[handle.idx].active = false;
+        }
+
+        /// The hold this handle names, or null when it names none: out of
+        /// range, already settled, or a slot that has since taken someone
+        /// else's SYN. The generation is what separates the last case from
+        /// the others — a caller that went away to dial and came back late
+        /// used to land on whatever hold the slot held by then.
+        fn heldBy(self: *const Self, handle: PendingHandle) ?PendingSyn {
+            if (handle.idx >= max_pending_syns) return null;
+            const ps = self.pending_syns[handle.idx];
+            if (!ps.active or ps.gen != handle.gen) return null;
+            return ps;
+        }
+
+        /// Whether a handle still names the hold it was given for.
+        pub fn pendingSynHeld(self: *const Self, handle: PendingHandle) bool {
+            return self.heldBy(handle) != null;
         }
 
         /// Drop SYNs held longer than `timeout_ms` without an answer, the way
@@ -2920,8 +2953,9 @@ test "FullStack: a deferred port holds its SYN instead of answering it" {
     try testing.expectEqual(@as(u16, 0), stack.syn_queue_count);
     try testing.expectEqual(@as(usize, 1), stack.pendingSynCount());
     try testing.expectEqual(pending, stack.nextPendingSyn().?);
+    try testing.expect(stack.pendingSynHeld(pending));
 
-    const info = stack.pendingSynInfo(pending).?;
+    const info = stack.pendingSynInfo(pending.idx).?;
     try testing.expectEqual(@as(u16, 80), info.local_port);
     try testing.expectEqual(@as(u16, 5000), info.remote_port);
     try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 2 }, &info.remote_addr);
@@ -2930,11 +2964,77 @@ test "FullStack: a deferred port holds its SYN instead of answering it" {
     // A retransmission of the same SYN refreshes the hold, it does not take
     // a second slot.
     switch (stack.injectPacket(1200, pkt_buf[0..syn_len])) {
-        .syn_pending => |i| try testing.expectEqual(pending, i),
+        .syn_pending => |h| try testing.expectEqual(pending, h),
         else => return error.TestUnexpectedResult,
     }
     try testing.expectEqual(@as(usize, 1), stack.pendingSynCount());
-    try testing.expectEqual(@as(u64, 1200), stack.pendingSynInfo(pending).?.received_ms);
+    try testing.expectEqual(@as(u64, 1200), stack.pendingSynInfo(pending.idx).?.received_ms);
+}
+
+test "FullStack: a handle from a hold that is gone settles nothing" {
+    const Small = FullStackWith(16, .{ .max_pending_syns = 1 });
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = Small.init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // One hold, and a handle for it.
+    const first_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const stale = switch (stack.injectPacket(0, pkt_buf[0..first_len])) {
+        .syn_pending => |h| h,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // It goes away without being settled, and the only slot takes someone
+    // else's SYN — which is what a caller off dialling somewhere would come
+    // back to find.
+    try testing.expectEqual(@as(usize, 1), stack.expirePendingSyns(20_000, 5_000));
+    const second_len = buildTcpPacket(.{ 10, 0, 0, 3 }, 6000, .{ 10, 0, 0, 1 }, 80, 2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const current = switch (stack.injectPacket(20_000, pkt_buf[0..second_len])) {
+        .syn_pending => |h| h,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(stale.idx, current.idx); // the same slot
+    try testing.expect(stale.gen != current.gen); // a different hold
+    try testing.expect(!stack.pendingSynHeld(stale));
+    try testing.expect(stack.pendingSynHeld(current));
+
+    // The stale handle settles nothing, either way round.
+    try testing.expect(stack.acceptPending(stale, 20_100) == null);
+    stack.rejectPending(stale);
+    try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
+    try testing.expectEqual(@as(usize, 1), stack.pendingSynCount());
+
+    // And the hold that is actually there still answers to its own handle.
+    const idx = stack.acceptPending(current, 20_200) orelse return error.NoConnection;
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(syn_ack.flags.syn and syn_ack.flags.ack);
+    try testing.expectEqual(@as(u16, 6000), syn_ack.dst_port); // the second peer
+    try testing.expectEqual(@as(u32, 2001), syn_ack.ack);
+    _ = idx;
+}
+
+test "FullStack: a retransmission keeps the handle its hold was given" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listenDeferred(80, 128);
+
+    var pkt_buf: [128]u8 = undefined;
+    const len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    const first = switch (stack.injectPacket(0, pkt_buf[0..len])) {
+        .syn_pending => |h| h,
+        else => return error.TestUnexpectedResult,
+    };
+    // The peer retransmits: the same hold refreshed, so the handle a caller
+    // is already holding has to keep working.
+    const again = switch (stack.injectPacket(1_000, pkt_buf[0..len])) {
+        .syn_pending => |h| h,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(first, again);
+    try testing.expect(stack.pendingSynHeld(first));
 }
 
 test "FullStack: the pending table can be walked, not just peeked at" {
@@ -3095,7 +3195,7 @@ test "FullStack: unlisten resets the SYNs that port was holding" {
     try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
 
     // The other port keeps what it was holding.
-    try testing.expectEqual(@as(u16, 81), stack.pendingSynInfo(stack.nextPendingSyn().?).?.local_port);
+    try testing.expectEqual(@as(u16, 81), stack.pendingSynInfo(stack.nextPendingSyn().?.idx).?.local_port);
 }
 
 test "FullStack: a port can stop and start deferring" {
@@ -3156,8 +3256,8 @@ test "FullStack: a held v6 SYN is refused over v6, not over v4" {
         .syn_pending => |i| i,
         else => return error.TestUnexpectedResult,
     };
-    try testing.expect(stack.pendingSynInfo(pending).?.is_v6);
-    try testing.expectEqualSlices(u8, &them, &stack.pendingSynInfo(pending).?.remote_addr6);
+    try testing.expect(stack.pendingSynInfo(pending.idx).?.is_v6);
+    try testing.expectEqualSlices(u8, &them, &stack.pendingSynInfo(pending.idx).?.remote_addr6);
     try testing.expectEqual(@as(usize, 0), link_ep.outboundCount());
 
     stack.rejectPending(pending);
@@ -3199,10 +3299,10 @@ test "FullStack: two v6 peers that share four bytes are two holds" {
         else => return error.TestUnexpectedResult,
     };
 
-    try testing.expect(pa != pb);
+    try testing.expect(pa.idx != pb.idx);
     try testing.expectEqual(@as(usize, 2), stack.pendingSynCount());
-    try testing.expectEqualSlices(u8, &a, &stack.pendingSynInfo(pa).?.remote_addr6);
-    try testing.expectEqualSlices(u8, &b, &stack.pendingSynInfo(pb).?.remote_addr6);
+    try testing.expectEqualSlices(u8, &a, &stack.pendingSynInfo(pa.idx).?.remote_addr6);
+    try testing.expectEqualSlices(u8, &b, &stack.pendingSynInfo(pb.idx).?.remote_addr6);
 }
 
 test "FullStack: acceptPending on a v6 hold answers over v6" {
