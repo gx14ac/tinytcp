@@ -70,6 +70,12 @@ pub const Event = union(enum) {
 pub const PendingHandle = struct {
     idx: u16,
     gen: u32,
+
+    /// Whether two handles name the same hold. Here rather than in each
+    /// caller, so nobody compares one field and not the other.
+    pub fn eql(self: PendingHandle, other: PendingHandle) bool {
+        return self.idx == other.idx and self.gen == other.gen;
+    }
 };
 
 /// Full integrated stack with default config.
@@ -1678,7 +1684,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         fn heldBy(self: *const Self, handle: PendingHandle) ?PendingSyn {
             if (handle.idx >= max_pending_syns) return null;
             const ps = self.pending_syns[handle.idx];
-            if (!ps.active or ps.gen != handle.gen) return null;
+            if (!ps.active or !handle.eql(.{ .idx = handle.idx, .gen = ps.gen })) return null;
             return ps;
         }
 
@@ -3014,6 +3020,13 @@ test "FullStack: a handle from a hold that is gone settles nothing" {
     try testing.expectEqual(@as(u16, 6000), syn_ack.dst_port); // the second peer
     try testing.expectEqual(@as(u32, 2001), syn_ack.ack);
     _ = idx;
+}
+
+test "FullStack: two handles name the same hold only if both halves agree" {
+    const h = PendingHandle{ .idx = 3, .gen = 7 };
+    try testing.expect(h.eql(.{ .idx = 3, .gen = 7 }));
+    try testing.expect(!h.eql(.{ .idx = 3, .gen = 8 })); // same slot, later hold
+    try testing.expect(!h.eql(.{ .idx = 4, .gen = 7 })); // same generation, other slot
 }
 
 test "FullStack: a retransmission keeps the handle its hold was given" {
