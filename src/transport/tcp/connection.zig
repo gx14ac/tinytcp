@@ -1534,7 +1534,6 @@ test "Connection: a window advertised in close_wait is used" {
         .send => |seg| try testing.expectEqual(@as(usize, 4), seg.payload_len),
         else => return error.TestUnexpectedResult,
     }
-    // Its window is full until it says otherwise.
     // Its window is full until it says otherwise. What is left to come out
     // is the delayed ACK for the FIN, which carries no data.
     switch (conn.poll(12)) {
@@ -1550,6 +1549,78 @@ test "Connection: a window advertised in close_wait is used" {
         .send => |seg| {
             try testing.expectEqual(@as(u32, 1005), seg.seq);
             try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: sending waits when the retransmit queue is full" {
+    var conn = makeEstablished();
+    conn.sender.mss = 1; // one byte per segment, one queue entry per byte
+    const capacity = conn.sender.retx_queue.len;
+
+    var msg: [300]u8 = undefined;
+    for (&msg, 0..) |*b, i| b.* = @intCast('a' + i % 26);
+    try testing.expect(msg.len > capacity);
+    try testing.expectEqual(msg.len, conn.write(&msg));
+
+    // The queue fills and sending stops there, rather than overwriting the
+    // oldest entry with the newest segment.
+    var sent: usize = 0;
+    var t: u64 = 10;
+    while (t < 500) : (t += 1) {
+        switch (conn.poll(t)) {
+            .send => |seg| sent += seg.payload_len,
+            else => break,
+        }
+    }
+    try testing.expectEqual(capacity, sent);
+    try testing.expectEqual(capacity, conn.sender.retx_count);
+
+    // Acking them all empties the queue and takes exactly those bytes out of
+    // the buffer: nothing was sent that the ACK cannot account for.
+    _ = conn.onSegment(t, .{ .ack = true }, 2000, @intCast(1001 + capacity), 65535, &.{});
+    try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
+    try testing.expectEqual(msg.len - capacity, conn.send_buf_len);
+    try testing.expectEqual(@as(usize, 0), conn.send_buf_sent);
+
+    // And the bytes still waiting are the ones that follow, in order.
+    switch (conn.poll(t + 1)) {
+        .send => |seg| try testing.expectEqualSlices(
+            u8,
+            msg[capacity .. capacity + seg.payload_len],
+            conn.send_buf[seg.payload_offset..][0..seg.payload_len],
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a partial ACK's fast retransmit is not written over" {
+    var conn = makeEstablished();
+    conn.sender.mss = 4;
+    _ = conn.write("ABCDEFGHIJKL");
+    _ = conn.poll(10);
+    _ = conn.poll(11);
+    _ = conn.poll(12);
+    try testing.expectEqual(@as(usize, 3), conn.sender.retx_count);
+
+    // ABCD is acked, then three duplicate ACKs say EFGH went missing.
+    _ = conn.onSegment(13, .{ .ack = true }, 2000, 1005, 65535, &.{});
+    for (0..3) |_| _ = conn.onSegment(14, .{ .ack = true }, 2000, 1005, 65535, &.{});
+    try testing.expect(conn.sender.in_fast_recovery);
+    try testing.expectEqual(timer_mod.Timer.fast_retransmit, conn.sender.timer);
+
+    // A partial ACK covers EFGH but not IJKL, and asks for IJKL to be sent
+    // again at once. The rest of the ACK handling must leave that alone: an
+    // RTO deadline in its place means waiting out the timeout instead.
+    _ = conn.onSegment(15, .{ .ack = true }, 2000, 1009, 65535, &.{});
+    try testing.expectEqual(timer_mod.Timer.fast_retransmit, conn.sender.timer);
+
+    // So the next poll retransmits rather than sitting on its hands.
+    switch (conn.poll(16)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(u32, 1009), seg.seq);
+            try testing.expectEqualSlices(u8, "IJKL", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
         },
         else => return error.TestUnexpectedResult,
     }
