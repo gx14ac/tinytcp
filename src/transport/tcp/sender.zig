@@ -172,12 +172,20 @@ pub fn SenderWith(comptime cfg: Config) type {
             };
         }
 
-        /// Record a SYN this side has already put on the wire so the
-        /// retransmit queue owns it like any other segment. A passive open
-        /// answers with SYN+ACK before poll() ever runs, and writing the ring
-        /// by hand there left its tail behind its count: the next segment
-        /// overwrote the SYN, and the entry the ring handed out once the data
-        /// was acked had never been written at all.
+        /// Record a SYN this side has already put on the wire, so the
+        /// retransmit queue accounts for it. A passive open answers with
+        /// SYN+ACK before poll() ever runs, and writing the ring by hand
+        /// there left its tail behind its count: the next segment overwrote
+        /// the SYN, and the entry the ring handed out once the data was
+        /// acked had never been written at all.
+        ///
+        /// What this does not do is arm the retransmit timer or start an RTT
+        /// sample, because nothing would use them: poll() only drives the
+        /// sender from syn_sent and established, so a connection sitting in
+        /// syn_received never asks the timer anything. A SYN+ACK that is lost
+        /// is therefore not resent — the connection waits on the peer, which
+        /// is what it did before this queued the SYN properly, and is its own
+        /// thing to fix.
         pub fn trackSyn(self: *Self, seq: u32, now_ms: u64) void {
             self.syn_sent = true;
             self.snd_una = seq;
