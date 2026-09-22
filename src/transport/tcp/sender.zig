@@ -251,6 +251,15 @@ pub fn SenderWith(comptime cfg: Config) type {
                 return self.handleTimerExpiry(now_ms);
             }
 
+            // Nothing may leave that the queue has no room to track, and
+            // that covers every segment this function emits, SYN and FIN
+            // included. It used to drop its oldest entry to make room, which
+            // loses the bytes that entry was accounting for: they are never
+            // acked back to the send buffer, so they sit at the front of it
+            // forever and everything written after them goes out shifted.
+            // Retransmissions are above this: they are already in the queue.
+            if (self.retx_count >= retx_queue_size) return .none;
+
             // If SYN not yet sent
             if (!self.syn_sent) {
                 self.syn_sent = true;
@@ -272,13 +281,6 @@ pub fn SenderWith(comptime cfg: Config) type {
 
             // SYN must be acked before sending data
             if (!self.syn_acked) return .none;
-
-            // Nothing may leave that the queue has no room to track. It used
-            // to drop its oldest entry to make room, which loses the bytes
-            // that entry was accounting for: they are never acked back to
-            // the send buffer, so they sit at the front of it forever and
-            // everything written after them goes out shifted.
-            if (self.retx_count >= retx_queue_size) return .none;
 
             // Try to send data
             const available = self.canSend(send_buf_pending);

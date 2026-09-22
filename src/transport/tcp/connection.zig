@@ -233,7 +233,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     } };
                 },
                 .listen => {
-                    return self.onSegmentListen(flags, seg_seq);
+                    return self.onSegmentListen(now_ms, flags, seg_seq);
                 },
                 .syn_sent => {
                     return self.onSegmentSynSent(now_ms, flags, seg_seq, seg_ack, seg_wnd);
@@ -486,13 +486,21 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
         // -- State-specific handlers --
 
-        fn onSegmentListen(self: *Self, flags: tcp_header.Flags, seg_seq: u32) Output {
+        fn onSegmentListen(self: *Self, now_ms: u64, flags: tcp_header.Flags, seg_seq: u32) Output {
             if (flags.rst) return .none;
             if (!flags.syn) return .none;
 
             // Received SYN: init receiver, transition to SYN_RECEIVED
             self.receiver = ReceiverT.init(seg_seq, 65535);
             self.state = .syn_received;
+
+            // The SYN+ACK below is on the wire as far as the peer is
+            // concerned, so the sender is told about it: it advances snd_nxt
+            // past the sequence number the SYN consumes, which is what makes
+            // the ACK that completes the handshake acceptable, and it puts
+            // the SYN where an ACK can acknowledge it. The stack's own
+            // accept path does the same through acceptFromSyn.
+            self.sender.trackSyn(self.sender.iss, now_ms);
 
             // Send SYN+ACK (with options)
             return .{ .send = .{
@@ -887,9 +895,6 @@ test "Connection: client-server handshake" {
 
     // Server receives ACK → becomes ESTABLISHED
     // The server's sender needs to know that SYN was sent and the ack should match ISS+1=2001
-    // The server's sender has to know its SYN is out there, the way a
-    // passive open records it, or the ACK has nothing to acknowledge.
-    server.sender.trackSyn(2000, 10);
     const estab_out = server.onSegment(30, .{ .ack = true }, 1001, 2001, 65535, &.{});
     try testing.expectEqual(State.established, server.state);
     switch (estab_out) {
@@ -1823,4 +1828,27 @@ test "Connection: an ACK for bytes we never sent is refused" {
     _ = conn.onSegment(12, .{ .ack = true }, 2000, 1005, 65535, &.{});
     try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
     try testing.expectEqual(@as(usize, 0), conn.send_buf_len);
+}
+
+test "Connection: a connection that listens completes its handshake" {
+    var conn = Connection.listen(80);
+    conn.sender = Sender.init(2000, 1460);
+
+    switch (conn.onSegment(10, .{ .syn = true }, 1000, 0, 65535, &.{})) {
+        .send => |seg| {
+            try testing.expect(seg.flags.syn and seg.flags.ack);
+            try testing.expectEqual(@as(u32, 2000), seg.seq);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.syn_received, conn.state);
+
+    // The ACK that completes the handshake acknowledges the SYN this side
+    // just sent, so the sender has to know it sent it: otherwise the ACK is
+    // for a sequence number it has never reached, which is refused, and the
+    // connection sits in syn_received forever.
+    try testing.expectEqual(Output.established, conn.onSegment(20, .{ .ack = true }, 1001, 2001, 65535, &.{}));
+    try testing.expectEqual(State.established, conn.state);
+    try testing.expect(conn.sender.syn_acked);
+    try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
 }
