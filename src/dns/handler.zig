@@ -232,8 +232,17 @@ pub fn rdataName(ans: *const Answer, data: []const u8, out: []u8) ?u8 {
         TYPE_CNAME, TYPE_PTR, TYPE_NS => {},
         else => return null,
     }
+    if (!rdataFits(ans, data)) return null;
     const r = parseName(data, ans.rdata_offset, out) orelse return null;
+    // parseName stops at the end of the message; the record says where its
+    // own data stops, and a name may not run past that into the next one.
+    if (r.consumed > ans.rdlength) return null;
     return r.len;
+}
+
+/// Whether the record's data is inside the message it came in.
+fn rdataFits(ans: *const Answer, data: []const u8) bool {
+    return ans.rdata_offset + ans.rdlength <= data.len;
 }
 
 /// What an SRV record says about where a service is, its target name aside
@@ -247,7 +256,7 @@ pub const Srv = struct {
 pub fn srvFields(ans: *const Answer, data: []const u8) ?Srv {
     if (ans.atype != TYPE_SRV) return null;
     if (ans.rdlength < 6) return null;
-    if (ans.rdata_offset + 6 > data.len) return null;
+    if (!rdataFits(ans, data)) return null;
     return .{
         .priority = readU16(data, ans.rdata_offset),
         .weight = readU16(data, ans.rdata_offset + 2),
@@ -259,7 +268,9 @@ pub fn srvFields(ans: *const Answer, data: []const u8) ?Srv {
 pub fn srvTarget(ans: *const Answer, data: []const u8, out: []u8) ?u8 {
     if (ans.atype != TYPE_SRV) return null;
     if (ans.rdlength < 7) return null;
+    if (!rdataFits(ans, data)) return null;
     const r = parseName(data, ans.rdata_offset + 6, out) orelse return null;
+    if (r.consumed > ans.rdlength - 6) return null;
     return r.len;
 }
 
@@ -285,9 +296,8 @@ pub const TxtStrings = struct {
 
 pub fn txtStrings(ans: *const Answer, data: []const u8) ?TxtStrings {
     if (ans.atype != TYPE_TXT) return null;
-    const end = ans.rdata_offset + ans.rdlength;
-    if (end > data.len) return null;
-    return .{ .data = data, .pos = ans.rdata_offset, .end = end };
+    if (!rdataFits(ans, data)) return null;
+    return .{ .data = data, .pos = ans.rdata_offset, .end = ans.rdata_offset + ans.rdlength };
 }
 
 /// Write a name in wire format: each label with its length in front, and a
@@ -295,7 +305,9 @@ pub fn txtStrings(ans: *const Answer, data: []const u8) ?TxtStrings {
 /// not fit or is not one.
 pub fn encodeName(out: []u8, name: []const u8) ?usize {
     var written: usize = 0;
-    var rest = name;
+    // The root is a name with no labels, written as "." as often as it is
+    // written as nothing at all.
+    var rest = if (name.len == 1 and name[0] == '.') name[1..] else name;
     while (rest.len > 0) {
         const dot = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
         if (dot == 0 or dot > 63) return null;
@@ -347,6 +359,10 @@ pub const ResponseBuilder = struct {
         return .{ .buf = buf, .len = q.end_offset };
     }
 
+    /// Truncated: an answer did not fit, so the client is told to ask again
+    /// over TCP rather than being handed what did fit as the whole story.
+    const flag_tc: u16 = 0x0200;
+
     pub fn addA(self: *Self, ttl: u32, addr: [4]u8) bool {
         return self.addRecord(TYPE_A, ttl, &addr);
     }
@@ -362,9 +378,20 @@ pub const ResponseBuilder = struct {
         return self.addRecord(TYPE_PTR, ttl, encoded[0..n]);
     }
 
-    /// Say there is no such name. A resolver sends this with no answers.
+    /// Say there is no such name, which comes with no answers: any that
+    /// were added go, rather than being sent alongside a code that says
+    /// there is nothing to send.
     pub fn setNameError(self: *Self) void {
         writeU16(self.buf, 2, (readU16(self.buf, 2) & 0xFFF0) | 3);
+        self.len = questionEnd(self.buf);
+        self.an_count = 0;
+    }
+
+    /// Where the question this was built from ends, which is where answers
+    /// start and where dropping them puts the length back.
+    fn questionEnd(buf: []const u8) usize {
+        const q = parseQuestion(buf) orelse return HEADER_LEN;
+        return q.end_offset;
     }
 
     /// The response, with its answer count filled in.
@@ -375,8 +402,10 @@ pub const ResponseBuilder = struct {
 
     fn addRecord(self: *Self, rtype: u16, ttl: u32, rdata: []const u8) bool {
         const need = name_pointer.len + 2 + 2 + 4 + 2 + rdata.len;
-        if (self.len + need > self.buf.len) return false;
-        if (self.an_count == std.math.maxInt(u16)) return false;
+        if (self.len + need > self.buf.len or self.an_count == std.math.maxInt(u16)) {
+            writeU16(self.buf, 2, readU16(self.buf, 2) | flag_tc);
+            return false;
+        }
         var at = self.len;
         @memcpy(self.buf[at..][0..name_pointer.len], &name_pointer);
         at += name_pointer.len;
@@ -1048,11 +1077,14 @@ test "dns: a PTR answer carries a name, and a name error carries none" {
     answers[0].atype = TYPE_A;
     try testing.expect(rdataName(&answers[0], response, &name) == null);
 
+    // A name error comes with no answers, including ones already added.
     var nx = ResponseBuilder.init(&buf, &query).?;
+    try testing.expect(nx.addA(60, .{ 1, 2, 3, 4 }));
     nx.setNameError();
     const refused = nx.finish();
     try testing.expectEqual(@as(u16, 0), Header.parse(refused).?.an_count);
     try testing.expectEqual(@as(u16, 3), Header.parse(refused).?.flags & 0x000F);
+    try testing.expectEqual(parseQuestion(refused).?.end_offset, refused.len);
 }
 
 test "dns: a response stops when the buffer is full" {
@@ -1062,7 +1094,12 @@ test "dns: a response stops when the buffer is full" {
     var b = ResponseBuilder.init(&buf, &query).?;
     try testing.expect(b.addA(60, .{ 1, 2, 3, 4 }));
     try testing.expect(!b.addA(60, .{ 5, 6, 7, 8 }));
-    try testing.expectEqual(@as(u16, 1), Header.parse(b.finish()).?.an_count);
+    const partial = b.finish();
+    try testing.expectEqual(@as(u16, 1), Header.parse(partial).?.an_count);
+    // And it says so: the answer that did not fit is what the truncation
+    // bit is for, so the client asks again over TCP instead of taking this
+    // for the whole answer.
+    try testing.expect(Header.parse(partial).?.flags & 0x0200 != 0);
 
     // And a buffer that cannot even hold the question is refused outright.
     var tiny: [20]u8 = undefined;
@@ -1079,9 +1116,12 @@ test "dns: names go to the wire and come back" {
     const r = parseName(wire[0..n], 0, &back).?;
     try testing.expectEqualStrings("a.example", back[0..r.len]);
 
-    // A label of its own is a name, and so is the root.
+    // A label of its own is a name, and so is the root — written either as
+    // nothing or as a lone dot.
     try testing.expectEqual(@as(usize, 3), encodeName(&wire, "a").?);
     try testing.expectEqual(@as(usize, 1), encodeName(&wire, "").?);
+    try testing.expectEqual(@as(usize, 1), encodeName(&wire, ".").?);
+    try testing.expectEqual(@as(u8, 0), wire[0]);
 
     // An empty label, a label past 63 bytes, and a name past the buffer are
     // not names.
@@ -1149,4 +1189,48 @@ test "dns: an SRV record's numbers and target, and a TXT record's strings" {
     // Asking the wrong record for either of them says no.
     try testing.expect(srvFields(&answers[1], pkt[0..at]) == null);
     try testing.expect(txtStrings(&answers[0], pkt[0..at]) == null);
+}
+
+test "dns: a record's data cannot reach past the length it declares" {
+    const query = buildTestQuery();
+    var pkt: [128]u8 = [_]u8{0} ** 128;
+    @memcpy(pkt[0..query.len], &query);
+    writeU16(&pkt, 2, 0x8400);
+    writeU16(&pkt, 6, 1);
+
+    // A PTR record whose rdlength says four bytes, with a name behind it
+    // that runs on for more: the name is inside the message, so only the
+    // record's own length says where it stops.
+    const at: usize = query.len;
+    pkt[at] = 0xC0;
+    pkt[at + 1] = HEADER_LEN;
+    writeU16(&pkt, at + 2, TYPE_PTR);
+    writeU16(&pkt, at + 4, CLASS_IN);
+    writeU32(&pkt, at + 6, 30);
+    writeU16(&pkt, at + 10, 4);
+    var name_wire: [32]u8 = undefined;
+    const n = encodeName(&name_wire, "long.example").?;
+    @memcpy(pkt[at + 12 ..][0..n], name_wire[0..n]);
+    const end = at + 12 + n;
+
+    var answers: [2]Answer = undefined;
+    try testing.expectEqual(@as(usize, 1), parseAnswers(pkt[0..end], &answers));
+    var out: [256]u8 = undefined;
+    try testing.expect(rdataName(&answers[0], pkt[0..end], &out) == null);
+
+    // With the length it actually needs, the same bytes read fine.
+    writeU16(&pkt, at + 10, @intCast(n));
+    _ = parseAnswers(pkt[0..end], &answers);
+    const len = rdataName(&answers[0], pkt[0..end], &out).?;
+    try testing.expectEqualStrings("long.example", out[0..len]);
+
+    // A record that claims more data than the message holds is not read at
+    // all, whatever its type.
+    answers[0].rdlength = 200;
+    try testing.expect(rdataName(&answers[0], pkt[0..end], &out) == null);
+    answers[0].atype = TYPE_SRV;
+    try testing.expect(srvFields(&answers[0], pkt[0..end]) == null);
+    try testing.expect(srvTarget(&answers[0], pkt[0..end], &out) == null);
+    answers[0].atype = TYPE_TXT;
+    try testing.expect(txtStrings(&answers[0], pkt[0..end]) == null);
 }
