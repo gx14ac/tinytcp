@@ -48,6 +48,77 @@ fn pump(client: *FullStack, client_link: *link_mod.ChannelEndpoint, server: *Ful
     }
 }
 
+/// A link that loses some of what it carries, and sometimes hands two
+/// copies to the other side.
+///
+/// The numbers are out of a hundred and the sequence is seeded, so a run
+/// that fails is one anyone can repeat.
+const LossyLink = struct {
+    drop_percent: u8 = 0,
+    duplicate_percent: u8 = 0,
+    prng: std.Random.DefaultPrng,
+    dropped: usize = 0,
+    duplicated: usize = 0,
+
+    fn init(seed: u64, drop_percent: u8, duplicate_percent: u8) LossyLink {
+        return .{
+            .drop_percent = drop_percent,
+            .duplicate_percent = duplicate_percent,
+            .prng = std.Random.DefaultPrng.init(seed),
+        };
+    }
+
+    fn happens(self: *LossyLink, percent: u8) bool {
+        if (percent == 0) return false;
+        return self.prng.random().intRangeLessThan(u8, 0, 100) < percent;
+    }
+
+    /// Carry what one side wrote to the other, losing and duplicating on the
+    /// way. Returns how many packets arrived.
+    fn carry(self: *LossyLink, src: *link_mod.ChannelEndpoint, dst: *link_mod.ChannelEndpoint) usize {
+        var arrived: usize = 0;
+        var buf: [1600]u8 = undefined;
+        while (src.readOutbound(&buf)) |pkt| {
+            if (self.happens(self.drop_percent)) {
+                self.dropped += 1;
+                continue;
+            }
+            _ = dst.writeInbound(pkt);
+            arrived += 1;
+            if (self.happens(self.duplicate_percent)) {
+                _ = dst.writeInbound(pkt);
+                self.duplicated += 1;
+                arrived += 1;
+            }
+        }
+        return arrived;
+    }
+};
+
+/// pump, with a link that loses things in both directions.
+fn pumpLossy(
+    client: *FullStack,
+    client_link: *link_mod.ChannelEndpoint,
+    server: *FullStack,
+    server_link: *link_mod.ChannelEndpoint,
+    link: *LossyLink,
+    now_ms: *u64,
+    rounds: usize,
+) void {
+    for (0..rounds) |_| {
+        _ = link.carry(client_link, server_link);
+        _ = link.carry(server_link, client_link);
+        injectAll(server, server_link, now_ms.*);
+        injectAll(client, client_link, now_ms.*);
+        _ = server.poll(now_ms.*);
+        _ = client.poll(now_ms.*);
+        // A retransmit timer is measured in hundreds of milliseconds, and a
+        // round is a step of the clock: without a step that reaches one,
+        // nothing lost is ever sent again.
+        now_ms.* += 20;
+    }
+}
+
 /// Inject all pending inbound packets into a stack.
 fn injectAll(stack: *FullStack, link: *link_mod.ChannelEndpoint, now_ms: u64) void {
     var buf: [1600]u8 = undefined;
@@ -331,4 +402,43 @@ test "E2E: multiple connections" {
     try testing.expect(server.accept() != null);
     try testing.expect(server.accept() != null);
     try testing.expect(server.accept() != null);
+}
+
+test "E2E: a transfer over a link that loses a tenth of it still arrives whole" {
+    var client_link = link_mod.ChannelEndpoint.init();
+    var server_link = link_mod.ChannelEndpoint.init();
+    var client = FullStack.init(&client_link, client_addr);
+    var server = FullStack.init(&server_link, server_addr);
+    var lossy = LossyLink.init(0x10551055, 12, 6);
+
+    _ = server.listen(80, 16);
+    const c_idx = client.connect(0, server_addr, 80, 5010).?;
+
+    var now: u64 = 1;
+    pumpLossy(&client, &client_link, &server, &server_link, &lossy, &now, 60);
+    const s_idx = server.accept() orelse return error.HandshakeNeverFinished;
+
+    // Thirty-two kilobytes with every byte saying where it belongs, so a
+    // byte that arrives twice or out of order is not mistaken for the right
+    // one.
+    var send_data: [32768]u8 = undefined;
+    for (&send_data, 0..) |*b, i| b.* = @intCast((i * 31) & 0xff);
+
+    var sent: usize = 0;
+    var recv_data: [32768]u8 = undefined;
+    var received: usize = 0;
+    var rounds: usize = 0;
+    while (received < send_data.len and rounds < 4_000) : (rounds += 1) {
+        if (sent < send_data.len) sent += client.write(c_idx, send_data[sent..]);
+        pumpLossy(&client, &client_link, &server, &server_link, &lossy, &now, 1);
+        received += server.read(s_idx, recv_data[received..]);
+    }
+
+    try testing.expectEqual(send_data.len, received);
+    try testing.expectEqualSlices(u8, &send_data, recv_data[0..received]);
+
+    // And the link really did lose and repeat things, rather than the run
+    // happening to be a clean one: this seed loses four and repeats four.
+    try testing.expect(lossy.dropped >= 3);
+    try testing.expect(lossy.duplicated >= 3);
 }
