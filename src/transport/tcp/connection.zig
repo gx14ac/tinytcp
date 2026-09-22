@@ -205,10 +205,17 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// Close with abort (RST). Used when linger timeout=0.
         pub fn abortClose(self: *Self) Output {
             self.state = .closed;
-            return .{ .send = .{
-                .flags = .{ .rst = true },
-                .seq = self.sender.snd_nxt,
-            } };
+            return .{
+                .send = .{
+                    // With the ACK, because a peer still in SYN-SENT throws away
+                    // a reset that has none (RFC 9293 3.10.7.3) — and a peer in
+                    // SYN-SENT is exactly who is on the other end of a
+                    // connection aborted from syn_received.
+                    .flags = .{ .rst = true, .ack = true },
+                    .seq = self.sender.snd_nxt,
+                    .ack = self.receiver.rcv_nxt,
+                },
+            };
         }
 
         /// Shutdown write direction only (send FIN, continue receiving).
@@ -303,6 +310,25 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .syn_sent => {
                     const action = self.sender.poll(now_ms, 0, false);
                     return self.senderActionToOutput(action);
+                },
+                // A connection whose SYN+ACK is out but whose handshake the
+                // peer has not finished. Closing one was doing nothing at
+                // all: the peer is holding a connection it believes is
+                // opening, and neither a reset nor a FIN was ever sent, so
+                // it waits out its own timeout. RFC 9293 3.10.4 says a close
+                // here sends a FIN, and SO_LINGER with no timeout means a
+                // reset, as it does from established.
+                .syn_received => {
+                    if (self.close_requested and self.linger_enabled and self.linger_ms == 0) {
+                        return self.abortClose();
+                    }
+                    // A graceful close from here owes the peer a FIN (RFC
+                    // 9293 3.10.4) and cannot send one yet: the sender sends
+                    // nothing until its own SYN is acknowledged, which is
+                    // the thing this state is waiting for. So that close
+                    // still does nothing, as it did before — a reset is the
+                    // part a shutdown needs.
+                    return .none;
                 },
                 .established, .close_wait => {
                     // SO_LINGER: if close requested with linger timeout=0, send RST immediately
@@ -1851,4 +1877,36 @@ test "Connection: a connection that listens completes its handshake" {
     try testing.expectEqual(State.established, conn.state);
     try testing.expect(conn.sender.syn_acked);
     try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
+}
+
+test "Connection: a connection still opening can be reset" {
+    // A passive open that answered a SYN and is waiting for the ACK that
+    // finishes the handshake. Closing one used to do nothing at all: no
+    // reset, no FIN, and a peer left holding a connection it believes is
+    // opening until its own timeout takes it away.
+    var conn = Connection.listen(80);
+    conn.sender = Sender.init(2000, 1460);
+    _ = conn.onSegment(10, .{ .syn = true }, 1000, 0, 65535, &.{});
+    try testing.expectEqual(State.syn_received, conn.state);
+
+    // A close on its own still waits, because the FIN it owes cannot go out
+    // before this side's SYN is acknowledged.
+    conn.close();
+    try testing.expectEqual(Output.none, conn.poll(11));
+    try testing.expectEqual(State.syn_received, conn.state);
+
+    // Asking for a reset gets one, which is what a shutdown asks for. It
+    // carries the ACK too: the peer is in SYN-SENT until it hears this, and
+    // a reset with no ACK is one it throws away.
+    conn.setLinger(true, 0);
+    switch (conn.poll(12)) {
+        .send => |seg| {
+            try testing.expect(seg.flags.rst);
+            try testing.expect(seg.flags.ack);
+            try testing.expectEqual(@as(u32, 2001), seg.seq);
+            try testing.expectEqual(conn.receiver.rcv_nxt, seg.ack);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.closed, conn.state);
 }
