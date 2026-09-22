@@ -208,7 +208,14 @@ pub fn SenderWith(comptime cfg: Config) type {
             var i: usize = 0;
             var idx = self.retx_head;
             while (i < self.retx_count) : (i += 1) {
-                self.retx_queue[idx].buf_offset -|= acked_bytes;
+                const seg = &self.retx_queue[idx];
+                // A data segment still in flight starts after the bytes this
+                // ACK just took out of the buffer. If it does not, the queue
+                // and the buffer disagree about what has been acked, and the
+                // saturating subtraction below would hide that by pointing
+                // the segment at whatever is now at the front.
+                std.debug.assert(seg.data_len == 0 or seg.buf_offset >= acked_bytes);
+                seg.buf_offset -|= acked_bytes;
                 idx = (idx + 1) % retx_queue_size;
             }
         }
@@ -265,6 +272,13 @@ pub fn SenderWith(comptime cfg: Config) type {
 
             // SYN must be acked before sending data
             if (!self.syn_acked) return .none;
+
+            // Nothing may leave that the queue has no room to track. It used
+            // to drop its oldest entry to make room, which loses the bytes
+            // that entry was accounting for: they are never acked back to
+            // the send buffer, so they sit at the front of it forever and
+            // everything written after them goes out shifted.
+            if (self.retx_count >= retx_queue_size) return .none;
 
             // Try to send data
             const available = self.canSend(send_buf_pending);
@@ -428,8 +442,12 @@ pub fn SenderWith(comptime cfg: Config) type {
             // If everything is acked, stop the timer
             if (self.retx_count == 0) {
                 self.timer.onAck();
-            } else {
-                // Reset timer for remaining segments
+            } else if (self.timer != .fast_retransmit) {
+                // Reset timer for remaining segments. Not when a fast
+                // retransmit is pending: the partial-ACK branch above and
+                // RACK both ask for one through this same timer, and an RTO
+                // deadline written over it means the retransmission they
+                // wanted now waits for the timeout they were avoiding.
                 self.timer.setRetransmit(now_ms, self.rtt.rtoMs());
             }
 
@@ -592,8 +610,12 @@ pub fn SenderWith(comptime cfg: Config) type {
         // -- Internal ring buffer operations --
 
         fn enqueue(self: *Self, seg: RetxSegment) void {
+            // poll() stops sending while the queue is full, so reaching here
+            // with no room means something emitted a segment behind its
+            // back. Dropping the oldest entry to make room is what this used
+            // to do, and it loses the bytes that entry was tracking.
+            std.debug.assert(self.retx_count < retx_queue_size);
             if (self.retx_count >= retx_queue_size) {
-                // Queue full — drop oldest (shouldn't happen in practice)
                 self.dequeue();
             }
             self.retx_queue[self.retx_tail] = seg;
