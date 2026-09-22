@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # Pull request runs share a group per pull request, so a new push drops the
+  # run it superseded. Pushes to main get a group of their own per commit: a
+  # queued run whose group is busy goes pending, and GitHub cancels a pending
+  # run as soon as another enters its group, whatever cancel-in-progress says.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      - name: zig fmt
+        run: zig fmt --check src tests examples build.zig
+
+      - name: zig build test
+        run: zig build test
