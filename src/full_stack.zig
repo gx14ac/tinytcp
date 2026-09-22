@@ -372,9 +372,10 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     slot.conn.ecn_ece_pending = true;
                 }
 
+                const in_syn_queue = inSynQueue(slot);
                 const output = slot.conn.onSegment(now_ms, flags, seg_seq, seg_ack, seg_wnd, payload);
 
-                return self.handleConnOutput(idx, now_ms, output, payload.len);
+                return self.handleConnOutput(idx, now_ms, output, payload.len, in_syn_queue);
             }
 
             // New SYN → accept
@@ -475,8 +476,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     }
                 }
 
+                const in_syn_queue = inSynQueue(slot);
                 const output = slot.conn.onSegment(now_ms, flags, seg_seq, seg_ack, seg_wnd, payload);
-                return self.handleConnOutput(idx, now_ms, output, payload.len);
+                return self.handleConnOutput(idx, now_ms, output, payload.len, in_syn_queue);
             }
 
             if (flags.syn and !flags.ack) {
@@ -551,8 +553,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     }
                 }
 
+                const in_syn_queue = inSynQueue(slot);
                 const output = slot.conn.onSegment(now_ms, flags, seg_seq, seg_ack, seg_wnd, tcp_payload);
-                return self.handleConnOutput(idx, now_ms, output, tcp_payload.len);
+                return self.handleConnOutput(idx, now_ms, output, tcp_payload.len, in_syn_queue);
             }
 
             return .none;
@@ -615,21 +618,24 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             for (&self.conns, 0..) |*slot, idx| {
                 if (!slot.active) continue;
 
+                const in_syn_queue = inSynQueue(slot);
                 const output = slot.conn.poll(now_ms);
                 switch (output) {
                     .send => |seg| {
                         self.emitSegment(@intCast(idx), seg);
+                        // Closed on the way out: an abort sends its reset
+                        // like this, and there is nothing after it.
+                        if (slot.conn.state == .closed) {
+                            self.releaseConn(idx, in_syn_queue);
+                            return .{ .aborted = @intCast(idx) };
+                        }
                     },
                     .closed => {
-                        self.hashRemove(idx);
-                        slot.active = false;
-                        self.active_count -|= 1;
+                        self.releaseConn(idx, in_syn_queue);
                         return .{ .closed = @intCast(idx) };
                     },
                     .aborted => {
-                        self.hashRemove(idx);
-                        slot.active = false;
-                        self.active_count -|= 1;
+                        self.releaseConn(idx, in_syn_queue);
                         return .{ .aborted = @intCast(idx) };
                     },
                     else => {},
@@ -1824,11 +1830,37 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             }
         }
 
-        fn handleConnOutput(self: *Self, idx: usize, now_ms: u64, output: tcp_connection.Output, payload_len: usize) Event {
+        /// Give a slot back: its connection is closed and nothing more will
+        /// come out of it. `in_syn_queue` says whether it was still a
+        /// handshake this side was counting, which has to be read before the
+        /// connection moved — an abort is closed by the time it hands over
+        /// the reset it wants sent.
+        fn releaseConn(self: *Self, idx: usize, in_syn_queue: bool) void {
+            if (in_syn_queue) self.syn_queue_count -|= 1;
+            self.hashRemove(idx);
+            self.conns[idx].active = false;
+            self.active_count -|= 1;
+        }
+
+        /// Whether this slot is a handshake the SYN queue is counting.
+        fn inSynQueue(slot: *const ConnSlot) bool {
+            return slot.passive and slot.conn.state == .syn_received;
+        }
+
+        fn handleConnOutput(self: *Self, idx: usize, now_ms: u64, output: tcp_connection.Output, payload_len: usize, in_syn_queue: bool) Event {
             _ = now_ms;
             switch (output) {
                 .send => |seg| {
                     self.emitSegment(@intCast(idx), seg);
+                    // A connection that closed on its way out of that call
+                    // sent the last thing it will ever send — an abort hands
+                    // over its reset this way — so the slot goes back now
+                    // rather than being polled for an output that will never
+                    // come.
+                    if (self.conns[idx].conn.state == .closed) {
+                        self.releaseConn(idx, in_syn_queue);
+                        return .{ .aborted = @intCast(idx) };
+                    }
                 },
                 .established => {
                     const conn_idx: u16 = @intCast(idx);
@@ -1856,17 +1888,11 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     return .{ .established = conn_idx };
                 },
                 .closed => {
-                    if (self.conns[idx].conn.state == .syn_received) self.syn_queue_count -|= 1;
-                    self.hashRemove(idx);
-                    self.conns[idx].active = false;
-                    self.active_count -|= 1;
+                    self.releaseConn(idx, in_syn_queue);
                     return .{ .closed = @intCast(idx) };
                 },
                 .aborted => {
-                    if (self.conns[idx].conn.state == .syn_received) self.syn_queue_count -|= 1;
-                    self.hashRemove(idx);
-                    self.conns[idx].active = false;
-                    self.active_count -|= 1;
+                    self.releaseConn(idx, in_syn_queue);
                     return .{ .aborted = @intCast(idx) };
                 },
                 .none => {},
@@ -4255,4 +4281,45 @@ test "FullStack: forwarding disabled does not forward" {
     // Nothing forwarded (no egress link set, but also no forwarding)
     var fwd_buf: [1600]u8 = undefined;
     try testing.expect(link_ep.readOutbound(&fwd_buf) == null);
+}
+
+test "FullStack: a connection aborted while opening gives its slot back" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 10, 0, 0, 1 });
+    try testing.expect(stack.listen(80, 4));
+
+    // A SYN, answered with a SYN+ACK: one slot taken and one handshake in
+    // the SYN queue, which is the count that decides whether the listener
+    // still takes new connections or falls back to cookies.
+    var pkt_buf: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(1, pkt_buf[0..syn_len]);
+    try testing.expectEqual(@as(u16, 1), stack.active_count);
+    try testing.expectEqual(@as(u16, 1), stack.syn_queue_count);
+
+    // The peer never finishes the handshake and this side gives up on it.
+    var out_buf: [1600]u8 = undefined;
+    while (link_ep.readOutbound(&out_buf)) |_| {}
+    stack.setLinger(0, true, 0);
+    stack.close(0);
+    switch (stack.poll(2)) {
+        .aborted => |idx| try testing.expectEqual(@as(u16, 0), idx),
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The reset went out, and the slot and the handshake count came back.
+    const rst = link_ep.readOutbound(&out_buf).?;
+    const parsed = parseTcpFromRaw(rst).?;
+    try testing.expect(parsed.flags.rst);
+    try testing.expect(parsed.flags.ack);
+    try testing.expectEqual(@as(u16, 0), stack.active_count);
+    try testing.expectEqual(@as(u16, 0), stack.syn_queue_count);
+    try testing.expect(!stack.conns[0].active);
+
+    // And the listener still takes connections: a second SYN opens a slot
+    // rather than being answered with a cookie because the queue looks full.
+    const syn2_len = buildTcpPacket(.{ 10, 0, 0, 3 }, 40001, .{ 10, 0, 0, 1 }, 80, 2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(3, pkt_buf[0..syn2_len]);
+    try testing.expectEqual(@as(u16, 1), stack.active_count);
+    try testing.expectEqual(@as(u16, 1), stack.syn_queue_count);
 }

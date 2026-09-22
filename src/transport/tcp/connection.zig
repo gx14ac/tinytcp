@@ -205,10 +205,17 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// Close with abort (RST). Used when linger timeout=0.
         pub fn abortClose(self: *Self) Output {
             self.state = .closed;
-            return .{ .send = .{
-                .flags = .{ .rst = true },
-                .seq = self.sender.snd_nxt,
-            } };
+            return .{
+                .send = .{
+                    // With the ACK, because a peer still in SYN-SENT throws away
+                    // a reset that has none (RFC 9293 3.10.7.3) — and a peer in
+                    // SYN-SENT is exactly who is on the other end of a
+                    // connection aborted from syn_received.
+                    .flags = .{ .rst = true, .ack = true },
+                    .seq = self.sender.snd_nxt,
+                    .ack = self.receiver.rcv_nxt,
+                },
+            };
         }
 
         /// Shutdown write direction only (send FIN, continue receiving).
@@ -1888,12 +1895,16 @@ test "Connection: a connection still opening can be reset" {
     try testing.expectEqual(Output.none, conn.poll(11));
     try testing.expectEqual(State.syn_received, conn.state);
 
-    // Asking for a reset gets one, which is what a shutdown asks for.
+    // Asking for a reset gets one, which is what a shutdown asks for. It
+    // carries the ACK too: the peer is in SYN-SENT until it hears this, and
+    // a reset with no ACK is one it throws away.
     conn.setLinger(true, 0);
     switch (conn.poll(12)) {
         .send => |seg| {
             try testing.expect(seg.flags.rst);
+            try testing.expect(seg.flags.ack);
             try testing.expectEqual(@as(u32, 2001), seg.seq);
+            try testing.expectEqual(conn.receiver.rcv_nxt, seg.ack);
         },
         else => return error.TestUnexpectedResult,
     }
