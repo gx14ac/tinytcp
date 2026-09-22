@@ -120,7 +120,10 @@ pub fn parseName(data: []const u8, offset: usize, out: []u8) ?struct { len: u8, 
         if ((label_len & 0xC0) == 0xC0) {
             if (pos + 1 >= data.len) return null;
             const ptr_offset = (@as(usize, label_len & 0x3F) << 8) | @as(usize, data[pos + 1]);
-            if (ptr_offset >= pos) return null;
+            // Backwards, and no further back than the header: the twelve
+            // bytes in front of the first question are counts and flags, not
+            // labels.
+            if (ptr_offset >= pos or ptr_offset < HEADER_LEN) return null;
             jumps += 1;
             if (jumps > max_pointer_jumps) return null;
             if (!jumped) consumed = pos + 2 - offset;
@@ -506,19 +509,21 @@ test "DNS: parse question" {
 }
 
 test "DNS: parse name with pointer" {
-    // Simulate a name with compression pointer
-    var data: [32]u8 = undefined;
-    // At offset 0: label "foo" (4 bytes: len=3 + "foo")
-    data[0] = 3;
-    @memcpy(data[1..4], "foo");
-    data[4] = 0; // end
+    // Simulate a name with compression pointer. The offsets are where they
+    // would be in a message, since a pointer names one: the first question
+    // starts after the twelve-byte header.
+    var data: [48]u8 = undefined;
+    // At offset 12: label "foo" (4 bytes: len=3 + "foo")
+    data[12] = 3;
+    @memcpy(data[13..16], "foo");
+    data[16] = 0; // end
 
-    // At offset 5: pointer to offset 0
-    data[5] = 0xC0;
-    data[6] = 0x00;
+    // At offset 17: pointer to offset 12
+    data[17] = 0xC0;
+    data[18] = 12;
 
     var out: [256]u8 = undefined;
-    const result = parseName(&data, 5, &out).?;
+    const result = parseName(&data, 17, &out).?;
     try testing.expectEqualSlices(u8, "foo", out[0..result.len]);
     try testing.expectEqual(@as(usize, 2), result.consumed);
 }
@@ -674,6 +679,11 @@ test "dns: a name that points at itself is not a name" {
     var out: [256]u8 = undefined;
     try std.testing.expect(parseName(&pkt, HEADER_LEN, &out) == null);
 
+    // So does one that names the header, where there are no labels.
+    pkt[12] = 0xC0;
+    pkt[13] = 4; // QDCOUNT
+    try std.testing.expect(parseName(&pkt, 12, &out) == null);
+
     // A pointer that names something later in the packet goes the same way.
     pkt[12] = 0xC0;
     pkt[13] = 20;
@@ -718,12 +728,12 @@ test "dns: a name may follow a chain of pointers, but not an endless one" {
     // Seventeen pointers in a row is past what one name may follow, even
     // with a label of its own on the end of each.
     var deep: [512]u8 = [_]u8{0} ** 512;
-    deep[0] = 1;
-    deep[1] = 'z';
-    deep[2] = 0;
-    var dpos: usize = 4;
-    var dtarget: u8 = 0;
-    while (dpos + 4 <= 4 + 17 * 4) : (dpos += 4) {
+    deep[12] = 1;
+    deep[13] = 'z';
+    deep[14] = 0;
+    var dpos: usize = 16;
+    var dtarget: u8 = 12;
+    while (dpos + 4 <= 16 + 17 * 4) : (dpos += 4) {
         deep[dpos] = 1;
         deep[dpos + 1] = 'y';
         deep[dpos + 2] = 0xC0;
@@ -734,24 +744,25 @@ test "dns: a name may follow a chain of pointers, but not an endless one" {
 }
 
 test "dns: a compressed name is read through its pointer" {
-    // "a.example" at offset 4, then "b" + a pointer to the "example" label.
+    // "a.example" where the first question goes, then "b" + a pointer to
+    // the "example" label inside it.
     var pkt: [64]u8 = [_]u8{0} ** 64;
-    pkt[4] = 1;
-    pkt[5] = 'a';
-    pkt[6] = 7;
-    @memcpy(pkt[7..14], "example");
-    pkt[14] = 0;
-    pkt[20] = 1;
-    pkt[21] = 'b';
-    pkt[22] = 0xC0;
-    pkt[23] = 6; // the "example" label
+    pkt[12] = 1;
+    pkt[13] = 'a';
+    pkt[14] = 7;
+    @memcpy(pkt[15..22], "example");
+    pkt[22] = 0;
+    pkt[30] = 1;
+    pkt[31] = 'b';
+    pkt[32] = 0xC0;
+    pkt[33] = 14; // the "example" label
 
     var out: [256]u8 = undefined;
-    const full = parseName(&pkt, 4, &out).?;
+    const full = parseName(&pkt, 12, &out).?;
     try std.testing.expectEqualStrings("a.example", out[0..full.len]);
     try std.testing.expectEqual(@as(usize, 11), full.consumed);
 
-    const compressed = parseName(&pkt, 20, &out).?;
+    const compressed = parseName(&pkt, 30, &out).?;
     try std.testing.expectEqualStrings("b.example", out[0..compressed.len]);
     // Two labels' worth of bytes plus the pointer, and nothing beyond it.
     try std.testing.expectEqual(@as(usize, 4), compressed.consumed);
