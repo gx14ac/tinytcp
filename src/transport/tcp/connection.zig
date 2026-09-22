@@ -168,16 +168,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .sender = SenderT.init(isn, cfg.default_mss),
             };
             conn.applyPeerOptions(peer_opts);
-            conn.sender.syn_sent = true;
-            conn.sender.snd_nxt = isn +% 1;
-            conn.sender.snd_una = isn;
-            conn.sender.retx_queue[0] = .{
-                .seq = isn,
-                .len = 1,
-                .sent_at = now_ms,
-                .is_syn = true,
-            };
-            conn.sender.retx_count = 1;
+            conn.sender.trackSyn(isn, now_ms);
             return conn;
         }
 
@@ -262,7 +253,12 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .close_wait => {
                     // Process ACKs only
                     if (flags.ack) {
-                        _ = self.sender.onAck(now_ms, seg_ack);
+                        self.processAck(now_ms, seg_ack);
+                        // The peer is done sending, not done receiving: it
+                        // keeps advertising a window, and this side keeps
+                        // sending into it. Ignoring the window here freezes
+                        // it at whatever it was when the peer half-closed.
+                        self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
                     }
                     return .none;
                 },
@@ -317,7 +313,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     const action = self.sender.poll(now_ms, pending, has_fin);
                     switch (action) {
                         .send_data => |d| {
-                            self.send_buf_sent += d.data_len;
+                            if (!d.retransmit) self.send_buf_sent += d.data_len;
                             self.last_activity_ms = now_ms;
                             self.keepalive_probes_sent = 0;
                             return .{ .send = .{
@@ -409,6 +405,16 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             return self.sender.nextPollAt();
         }
 
+        /// Process an ACK and take what it acknowledged out of the send
+        /// buffer. Every state that reads an ACK goes through here: dropping
+        /// the count leaves the buffer holding bytes the peer already has,
+        /// and leaves the retransmit queue's offsets pointing at the wrong
+        /// ones, so the next segment out repeats data instead of sending the
+        /// bytes that follow it.
+        fn processAck(self: *Self, now_ms: u64, seg_ack: u32) void {
+            self.consumeAcked(self.sender.onAck(now_ms, seg_ack));
+        }
+
         /// Consume acked data from send buffer.
         pub fn consumeAcked(self: *Self, acked_bytes: usize) void {
             if (acked_bytes == 0) return;
@@ -425,6 +431,9 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     self.send_buf_sent = 0;
                 }
             }
+            // Whatever is left in flight starts that much earlier in the
+            // buffer now, and a retransmission reads it by offset.
+            self.sender.shiftBufOffsets(acked_bytes);
         }
 
         // -- State-specific handlers --
@@ -458,8 +467,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
             if (flags.syn and flags.ack) {
                 // SYN+ACK: validate ACK covers our SYN
-                const data_acked = self.sender.onAck(now_ms, seg_ack);
-                _ = data_acked;
+                self.processAck(now_ms, seg_ack);
 
                 if (!self.sender.syn_acked) {
                     // Invalid ACK
@@ -504,7 +512,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
             if (flags.ack) {
                 // ACK of our SYN+ACK
-                _ = self.sender.onAck(now_ms, seg_ack);
+                self.processAck(now_ms, seg_ack);
                 if (self.sender.syn_acked) {
                     self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
                     self.state = .established;
@@ -543,9 +551,8 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
             // Process ACK
             if (flags.ack) {
-                const acked = self.sender.onAck(now_ms, seg_ack);
+                self.processAck(now_ms, seg_ack);
                 self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
-                self.consumeAcked(acked);
             }
 
             // Process data (discard if read direction is shut down)
@@ -576,7 +583,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             }
 
             if (flags.ack) {
-                _ = self.sender.onAck(now_ms, seg_ack);
+                self.processAck(now_ms, seg_ack);
                 self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
             }
 
@@ -641,7 +648,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     } };
                 },
                 .send_data => |d| {
-                    self.send_buf_sent += d.data_len;
+                    if (!d.retransmit) self.send_buf_sent += d.data_len;
                     return .{ .send = .{
                         .flags = .{ .ack = true, .psh = true },
                         .seq = d.seq,
@@ -832,17 +839,9 @@ test "Connection: client-server handshake" {
 
     // Server receives ACK → becomes ESTABLISHED
     // The server's sender needs to know that SYN was sent and the ack should match ISS+1=2001
-    server.sender.syn_sent = true;
-    server.sender.snd_nxt = 2001;
-    server.sender.snd_una = 2000;
-    // Enqueue the SYN in retx queue so onAck can dequeue it
-    server.sender.retx_queue[0] = .{
-        .seq = 2000,
-        .len = 1,
-        .sent_at = 10,
-        .is_syn = true,
-    };
-    server.sender.retx_count = 1;
+    // The server's sender has to know its SYN is out there, the way a
+    // passive open records it, or the ACK has nothing to acknowledge.
+    server.sender.trackSyn(2000, 10);
     const estab_out = server.onSegment(30, .{ .ack = true }, 1001, 2001, 65535, &.{});
     try testing.expectEqual(State.established, server.state);
     switch (estab_out) {
@@ -1396,4 +1395,162 @@ test "Connection: ECN CWR received clears ECE pending" {
     // Receive CWR from peer
     _ = conn.onSegment(10, .{ .ack = true, .cwr = true }, 2000, 1001, 65535, &.{});
     try testing.expect(!conn.ecn_ece_pending);
+}
+
+test "Connection: a passive open's SYN leaves the retransmit ring consistent" {
+    var conn = Connection.acceptFromSyn(80, 1000, 0, .{});
+    const ring_len = conn.sender.retx_queue.len;
+
+    // The SYN is queued like any other segment: one entry, tail one past head.
+    try testing.expectEqual(@as(usize, 1), conn.sender.retx_count);
+    try testing.expectEqual((conn.sender.retx_head + 1) % ring_len, conn.sender.retx_tail);
+
+    // Answer the SYN, then let the peer finish the handshake.
+    _ = conn.onSegment(0, .{ .syn = true }, 2000, 0, 65535, &.{});
+    _ = conn.onSegment(1, .{ .ack = true }, 2001, 1001, 65535, &.{});
+    try testing.expectEqual(State.established, conn.state);
+    try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
+    try testing.expectEqual(conn.sender.retx_tail, conn.sender.retx_head);
+
+    // Data sent after the handshake is what the queue hands back, rather
+    // than an entry nobody ever wrote.
+    try testing.expectEqual(@as(usize, 5), conn.write("hello"));
+    switch (conn.poll(2)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 5), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), conn.sender.retx_count);
+
+    // Once it is acked nothing is left to retransmit.
+    _ = conn.onSegment(3, .{ .ack = true }, 2001, 1006, 65535, &.{});
+    try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
+    try testing.expectEqual(conn.sender.retx_tail, conn.sender.retx_head);
+}
+
+test "Connection: a retransmission does not count its bytes as sent twice" {
+    var conn = makeEstablished();
+    _ = conn.write("hello world");
+    switch (conn.poll(10)) {
+        .send => |seg| try testing.expectEqual(@as(usize, 11), seg.payload_len),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 11), conn.send_buf_sent);
+
+    // No ACK arrives, so the retransmit timer fires and sends them again.
+    switch (conn.poll(1010)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 11), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Still eleven bytes handed to the sender, not twenty-two: counting them
+    // again puts sent past len and the next poll subtracts into a huge
+    // pending, which is how many bytes we then claim to send.
+    try testing.expectEqual(@as(usize, 11), conn.send_buf_sent);
+    _ = conn.poll(1011);
+}
+
+test "Connection: a retransmission after a partial ACK resends the right bytes" {
+    var conn = makeEstablished();
+    conn.sender.mss = 4;
+    _ = conn.write("ABCDEFGH");
+
+    switch (conn.poll(10)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 4), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (conn.poll(11)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 4), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 4), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // The first four bytes are acked, which compacts the send buffer.
+    _ = conn.onSegment(12, .{ .ack = true }, 2000, 1005, 65535, &.{});
+    try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[0..conn.send_buf_len]);
+
+    // EFGH starts at the front of the buffer now, so that is where the
+    // retransmission has to read it from.
+    switch (conn.poll(3012)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 0), seg.payload_offset);
+            try testing.expectEqual(@as(usize, 4), seg.payload_len);
+            try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: an ACK in close_wait still consumes the send buffer" {
+    var conn = makeEstablished();
+    conn.sender.mss = 4;
+    _ = conn.write("ABCDEFGH");
+    _ = conn.poll(10);
+    _ = conn.poll(11);
+
+    // The peer half-closes: it is done sending, we are not.
+    _ = conn.onSegment(12, .{ .fin = true, .ack = true }, 2000, 1001, 65535, &.{});
+    try testing.expectEqual(State.close_wait, conn.state);
+
+    // It acks everything we sent. That has to leave the buffer empty, even
+    // though the ACK arrived in close_wait rather than established.
+    _ = conn.onSegment(13, .{ .ack = true }, 2001, 1009, 65535, &.{});
+    try testing.expectEqual(@as(usize, 0), conn.send_buf_len);
+    try testing.expectEqual(@as(usize, 0), conn.send_buf_sent);
+
+    // So what we write next is what goes out, rather than bytes the peer
+    // already has.
+    try testing.expectEqual(@as(usize, 4), conn.write("IJKL"));
+    switch (conn.poll(14)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(usize, 4), seg.payload_len);
+            try testing.expectEqualSlices(u8, "IJKL", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a window advertised in close_wait is used" {
+    var conn = makeEstablished();
+    conn.sender.mss = 4;
+    conn.sender.setMss(4);
+
+    // The peer half-closes: done sending, still receiving, and with room
+    // for four bytes.
+    _ = conn.onSegment(10, .{ .fin = true, .ack = true }, 2000, 1001, 4, &.{});
+    try testing.expectEqual(State.close_wait, conn.state);
+
+    _ = conn.write("ABCDEFGH");
+    switch (conn.poll(11)) {
+        .send => |seg| try testing.expectEqual(@as(usize, 4), seg.payload_len),
+        else => return error.TestUnexpectedResult,
+    }
+    // Its window is full until it says otherwise.
+    // Its window is full until it says otherwise. What is left to come out
+    // is the delayed ACK for the FIN, which carries no data.
+    switch (conn.poll(12)) {
+        .send => |seg| try testing.expectEqual(@as(usize, 0), seg.payload_len),
+        else => {},
+    }
+    try testing.expectEqual(Output.none, conn.poll(13));
+
+    // It makes room. A window update is a duplicate ACK, and close_wait has
+    // to read the window out of it like any other state does.
+    _ = conn.onSegment(14, .{ .ack = true }, 2001, 1001, 16, &.{});
+    switch (conn.poll(15)) {
+        .send => |seg| {
+            try testing.expectEqual(@as(u32, 1005), seg.seq);
+            try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

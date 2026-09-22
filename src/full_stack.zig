@@ -2427,18 +2427,8 @@ test "FullStack: complete 3-way handshake (server)" {
         &pkt_buf,
     );
 
-    // Manually set up sender state for the ACK to be processed correctly
-    var slot = &stack.conns[0];
-    slot.conn.sender.syn_sent = true;
-    slot.conn.sender.snd_nxt = server_isn + 1;
-    slot.conn.sender.snd_una = server_isn;
-    slot.conn.sender.retx_queue[0] = .{
-        .seq = server_isn,
-        .len = 1,
-        .sent_at = 0,
-        .is_syn = true,
-    };
-    slot.conn.sender.retx_count = 1;
+    // No sender setup here: answering the SYN recorded it already, and
+    // recording it twice is what this test used to do by hand.
 
     const event2 = stack.injectPacket(10, pkt_buf[0..ack_len]);
     switch (event2) {
@@ -3994,17 +3984,8 @@ test "FullStackWith: embedded_minimal config completes TCP handshake + data" {
 
     const server_isn = syn_ack.seq;
 
-    // Client sends ACK completing handshake
-    stack.conns[0].conn.sender.syn_sent = true;
-    stack.conns[0].conn.sender.snd_nxt = server_isn + 1;
-    stack.conns[0].conn.sender.snd_una = server_isn;
-    stack.conns[0].conn.sender.retx_queue[0] = .{
-        .seq = server_isn,
-        .len = 1,
-        .sent_at = 0,
-        .is_syn = true,
-    };
-    stack.conns[0].conn.sender.retx_count = 1;
+    // Client sends ACK completing handshake. As above, the SYN this side
+    // sent is already in its retransmit queue.
 
     const ack_len = buildTcpPacket(
         .{ 192, 168, 1, 2 },
