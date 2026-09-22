@@ -275,11 +275,16 @@ pub fn srvTarget(ans: *const Answer, data: []const u8, out: []u8) ?u8 {
 }
 
 /// The strings of a TXT record, which is a sequence of length-prefixed ones
-/// rather than a single string. Call next() until it returns null.
+/// rather than a single string. Call next() until it returns null, then ask
+/// `ok` whether that was the end of the record or the end of the sense it
+/// made: a string whose length runs past the record is not the record
+/// saying it has no more, and a caller that cannot tell the two apart
+/// believes whatever prefix of a malformed record it managed to read.
 pub const TxtStrings = struct {
     data: []const u8,
     pos: usize,
     end: usize,
+    ok: bool = true,
 
     pub fn next(self: *TxtStrings) ?[]const u8 {
         if (self.pos >= self.end) return null;
@@ -287,6 +292,7 @@ pub const TxtStrings = struct {
         const start = self.pos + 1;
         if (start + len > self.end) {
             self.pos = self.end;
+            self.ok = false;
             return null;
         }
         self.pos = start + len;
@@ -382,7 +388,10 @@ pub const ResponseBuilder = struct {
     /// were added go, rather than being sent alongside a code that says
     /// there is nothing to send.
     pub fn setNameError(self: *Self) void {
-        writeU16(self.buf, 2, (readU16(self.buf, 2) & 0xFFF0) | 3);
+        // The truncation bit goes with them: it says an answer was left out
+        // for want of room, and a client that reads it asks again over TCP
+        // for answers this is about to say do not exist.
+        writeU16(self.buf, 2, ((readU16(self.buf, 2) & 0xFFF0) | 3) & ~flag_tc);
         self.len = questionEnd(self.buf);
         self.an_count = 0;
     }
@@ -1080,6 +1089,15 @@ test "dns: a PTR answer carries a name, and a name error carries none" {
     // A name error comes with no answers, including ones already added.
     var nx = ResponseBuilder.init(&buf, &query).?;
     try testing.expect(nx.addA(60, .{ 1, 2, 3, 4 }));
+    // An answer that did not fit set the truncation bit; saying the name
+    // does not exist takes that back, or the client asks again over TCP for
+    // answers that are not there.
+    var small: [29 + 16]u8 = undefined;
+    var full = ResponseBuilder.init(&small, &query).?;
+    try testing.expect(full.addA(60, .{ 1, 2, 3, 4 }));
+    try testing.expect(!full.addA(60, .{ 5, 6, 7, 8 }));
+    full.setNameError();
+    try testing.expectEqual(@as(u16, 0), Header.parse(full.finish()).?.flags & 0x0200);
     nx.setNameError();
     const refused = nx.finish();
     try testing.expectEqual(@as(u16, 0), Header.parse(refused).?.an_count);
@@ -1185,6 +1203,17 @@ test "dns: an SRV record's numbers and target, and a TXT record's strings" {
     try testing.expectEqualStrings("one", strings.next().?);
     try testing.expectEqualStrings("two", strings.next().?);
     try testing.expect(strings.next() == null);
+    try testing.expect(strings.ok); // that was the end of the record
+
+    // A string whose length runs past the record ends the walk too, and the
+    // difference between the two is the difference between a record with
+    // one string in it and a record that was cut in half.
+    pkt[at - 4] = 9; // the second string claims more than it has
+    _ = parseAnswers(pkt[0..at], &answers);
+    var broken = txtStrings(&answers[1], pkt[0..at]).?;
+    try testing.expectEqualStrings("one", broken.next().?);
+    try testing.expect(broken.next() == null);
+    try testing.expect(!broken.ok);
 
     // Asking the wrong record for either of them says no.
     try testing.expect(srvFields(&answers[1], pkt[0..at]) == null);
