@@ -8,7 +8,12 @@ const std = @import("std");
 // DNS wire format constants
 pub const HEADER_LEN = 12;
 pub const TYPE_A: u16 = 1;
+pub const TYPE_NS: u16 = 2;
+pub const TYPE_CNAME: u16 = 5;
+pub const TYPE_PTR: u16 = 12;
+pub const TYPE_TXT: u16 = 16;
 pub const TYPE_AAAA: u16 = 28;
+pub const TYPE_SRV: u16 = 33;
 pub const CLASS_IN: u16 = 1;
 
 pub const SERVICE_IP_V4 = [4]u8{ 100, 200, 100, 200 };
@@ -217,6 +222,175 @@ pub fn parseAnswers(data: []const u8, out: []Answer) usize {
     }
     return count;
 }
+
+/// The name inside a record whose rdata is one: CNAME, PTR and NS. The
+/// message is needed as well as the record, because the name in there may
+/// point back into it. Returns its length in `out`, or null for a record
+/// that holds something else or a name that is not one.
+pub fn rdataName(ans: *const Answer, data: []const u8, out: []u8) ?u8 {
+    switch (ans.atype) {
+        TYPE_CNAME, TYPE_PTR, TYPE_NS => {},
+        else => return null,
+    }
+    const r = parseName(data, ans.rdata_offset, out) orelse return null;
+    return r.len;
+}
+
+/// What an SRV record says about where a service is, its target name aside
+/// (that one comes out of `srvTarget`).
+pub const Srv = struct {
+    priority: u16,
+    weight: u16,
+    port: u16,
+};
+
+pub fn srvFields(ans: *const Answer, data: []const u8) ?Srv {
+    if (ans.atype != TYPE_SRV) return null;
+    if (ans.rdlength < 6) return null;
+    if (ans.rdata_offset + 6 > data.len) return null;
+    return .{
+        .priority = readU16(data, ans.rdata_offset),
+        .weight = readU16(data, ans.rdata_offset + 2),
+        .port = readU16(data, ans.rdata_offset + 4),
+    };
+}
+
+/// The target of an SRV record, which follows its three numbers.
+pub fn srvTarget(ans: *const Answer, data: []const u8, out: []u8) ?u8 {
+    if (ans.atype != TYPE_SRV) return null;
+    if (ans.rdlength < 7) return null;
+    const r = parseName(data, ans.rdata_offset + 6, out) orelse return null;
+    return r.len;
+}
+
+/// The strings of a TXT record, which is a sequence of length-prefixed ones
+/// rather than a single string. Call next() until it returns null.
+pub const TxtStrings = struct {
+    data: []const u8,
+    pos: usize,
+    end: usize,
+
+    pub fn next(self: *TxtStrings) ?[]const u8 {
+        if (self.pos >= self.end) return null;
+        const len = self.data[self.pos];
+        const start = self.pos + 1;
+        if (start + len > self.end) {
+            self.pos = self.end;
+            return null;
+        }
+        self.pos = start + len;
+        return self.data[start .. start + len];
+    }
+};
+
+pub fn txtStrings(ans: *const Answer, data: []const u8) ?TxtStrings {
+    if (ans.atype != TYPE_TXT) return null;
+    const end = ans.rdata_offset + ans.rdlength;
+    if (end > data.len) return null;
+    return .{ .data = data, .pos = ans.rdata_offset, .end = end };
+}
+
+/// Write a name in wire format: each label with its length in front, and a
+/// zero at the end. Returns the bytes written, or null when the name does
+/// not fit or is not one.
+pub fn encodeName(out: []u8, name: []const u8) ?usize {
+    var written: usize = 0;
+    var rest = name;
+    while (rest.len > 0) {
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+        if (dot == 0 or dot > 63) return null;
+        if (written + 1 + dot + 1 > out.len) return null;
+        out[written] = @intCast(dot);
+        @memcpy(out[written + 1 ..][0..dot], rest[0..dot]);
+        written += 1 + dot;
+        rest = if (dot == rest.len) rest[dot..] else rest[dot + 1 ..];
+    }
+    if (written + 1 > out.len) return null;
+    if (written + 1 > 255) return null;
+    out[written] = 0;
+    return written + 1;
+}
+
+/// Builds a response to a query in the caller's buffer.
+///
+/// The query's header and question come back as the wire format requires,
+/// and each answer names the question with a pointer to it rather than
+/// spelling the name out again — which is what a resolver's answers look
+/// like, and keeps a response to a long name inside a datagram.
+pub const ResponseBuilder = struct {
+    const Self = @This();
+    /// The question's name always starts right after the header, so this is
+    /// the pointer every answer uses to name it.
+    const name_pointer = [2]u8{ 0xC0, HEADER_LEN };
+
+    buf: []u8,
+    len: usize,
+    an_count: u16 = 0,
+
+    /// Copy the header and question of `query`, with the response bit set.
+    /// Null for a query this cannot answer: one without a question, or a
+    /// buffer too small for the question it asks.
+    pub fn init(buf: []u8, query: []const u8) ?Self {
+        const q = parseQuestion(query) orelse return null;
+        if (q.end_offset > query.len) return null;
+        if (buf.len < q.end_offset) return null;
+        @memcpy(buf[0..q.end_offset], query[0..q.end_offset]);
+        // QR and AA set, RA and the rcode clear, and the query's RD kept:
+        // this answers from what it knows rather than from a recursion it
+        // did.
+        const flags = (readU16(query, 2) & 0x0100) | 0x8400;
+        writeU16(buf, 2, flags);
+        writeU16(buf, 4, 1); // one question, whatever the query claimed
+        writeU16(buf, 6, 0);
+        writeU16(buf, 8, 0);
+        writeU16(buf, 10, 0);
+        return .{ .buf = buf, .len = q.end_offset };
+    }
+
+    pub fn addA(self: *Self, ttl: u32, addr: [4]u8) bool {
+        return self.addRecord(TYPE_A, ttl, &addr);
+    }
+
+    pub fn addAAAA(self: *Self, ttl: u32, addr: [16]u8) bool {
+        return self.addRecord(TYPE_AAAA, ttl, &addr);
+    }
+
+    /// A PTR record, whose rdata is the name it points at.
+    pub fn addPtr(self: *Self, ttl: u32, name: []const u8) bool {
+        var encoded: [256]u8 = undefined;
+        const n = encodeName(&encoded, name) orelse return false;
+        return self.addRecord(TYPE_PTR, ttl, encoded[0..n]);
+    }
+
+    /// Say there is no such name. A resolver sends this with no answers.
+    pub fn setNameError(self: *Self) void {
+        writeU16(self.buf, 2, (readU16(self.buf, 2) & 0xFFF0) | 3);
+    }
+
+    /// The response, with its answer count filled in.
+    pub fn finish(self: *Self) []const u8 {
+        writeU16(self.buf, 6, self.an_count);
+        return self.buf[0..self.len];
+    }
+
+    fn addRecord(self: *Self, rtype: u16, ttl: u32, rdata: []const u8) bool {
+        const need = name_pointer.len + 2 + 2 + 4 + 2 + rdata.len;
+        if (self.len + need > self.buf.len) return false;
+        if (self.an_count == std.math.maxInt(u16)) return false;
+        var at = self.len;
+        @memcpy(self.buf[at..][0..name_pointer.len], &name_pointer);
+        at += name_pointer.len;
+        writeU16(self.buf, at, rtype);
+        writeU16(self.buf, at + 2, CLASS_IN);
+        writeU32(self.buf, at + 4, ttl);
+        writeU16(self.buf, at + 8, @intCast(rdata.len));
+        at += 10;
+        @memcpy(self.buf[at..][0..rdata.len], rdata);
+        self.len = at + rdata.len;
+        self.an_count += 1;
+        return true;
+    }
+};
 
 /// DNS resolver address.
 pub const Resolver = struct {
@@ -457,6 +631,14 @@ pub const DnsHandler = struct {
 // Helpers
 fn readU16(data: []const u8, offset: usize) u16 {
     return (@as(u16, data[offset]) << 8) | @as(u16, data[offset + 1]);
+}
+
+fn writeU16(data: []u8, offset: usize, value: u16) void {
+    std.mem.writeInt(u16, data[offset..][0..2], value, .big);
+}
+
+fn writeU32(data: []u8, offset: usize, value: u32) void {
+    std.mem.writeInt(u32, data[offset..][0..4], value, .big);
 }
 
 fn readU32(data: []const u8, offset: usize) u32 {
@@ -813,4 +995,158 @@ test "dns: a name is refused when it is too long, reserved or truncated" {
     // label after it.
     var truncated: [4]u8 = .{ 3, 'a', 'b', 'c' };
     try std.testing.expect(parseName(&truncated, 0, &out) == null);
+}
+
+test "dns: a response is built and reads back as one" {
+    const query = buildTestQuery();
+    var buf: [512]u8 = undefined;
+
+    var b = ResponseBuilder.init(&buf, &query).?;
+    try testing.expect(b.addA(60, .{ 100, 64, 0, 7 }));
+    try testing.expect(b.addAAAA(60, [_]u8{ 0xfd, 0x7a } ++ [_]u8{0} ** 13 ++ [_]u8{7}));
+    const response = b.finish();
+
+    // The query's id comes back, the response bit is set, and the question
+    // is the one that was asked.
+    const hdr = Header.parse(response).?;
+    try testing.expectEqual(@as(u16, 0x1234), hdr.id);
+    try testing.expect(hdr.isResponse());
+    try testing.expectEqual(@as(u16, 1), hdr.qd_count);
+    try testing.expectEqual(@as(u16, 2), hdr.an_count);
+
+    const q = parseQuestion(response).?;
+    try testing.expectEqualStrings("example.com", q.nameSlice());
+    try testing.expectEqual(TYPE_A, q.qtype);
+
+    // And the answers name that question through their pointer to it.
+    var answers: [4]Answer = undefined;
+    try testing.expectEqual(@as(usize, 2), parseAnswers(response, &answers));
+    try testing.expectEqualStrings("example.com", answers[0].name[0..answers[0].name_len]);
+    try testing.expectEqual(TYPE_A, answers[0].atype);
+    try testing.expectEqual(@as(u32, 60), answers[0].ttl);
+    try testing.expectEqualSlices(u8, &.{ 100, 64, 0, 7 }, &answers[0].ipv4);
+    try testing.expectEqual(TYPE_AAAA, answers[1].atype);
+    try testing.expectEqual(@as(u8, 0xfd), answers[1].ipv6[0]);
+    try testing.expectEqual(@as(u8, 7), answers[1].ipv6[15]);
+}
+
+test "dns: a PTR answer carries a name, and a name error carries none" {
+    const query = buildTestQuery();
+    var buf: [512]u8 = undefined;
+
+    var b = ResponseBuilder.init(&buf, &query).?;
+    try testing.expect(b.addPtr(120, "host.mesh.example"));
+    const response = b.finish();
+
+    var answers: [2]Answer = undefined;
+    try testing.expectEqual(@as(usize, 1), parseAnswers(response, &answers));
+    try testing.expectEqual(TYPE_PTR, answers[0].atype);
+    var name: [256]u8 = undefined;
+    const len = rdataName(&answers[0], response, &name).?;
+    try testing.expectEqualStrings("host.mesh.example", name[0..len]);
+    // The other record types do not hold a name.
+    answers[0].atype = TYPE_A;
+    try testing.expect(rdataName(&answers[0], response, &name) == null);
+
+    var nx = ResponseBuilder.init(&buf, &query).?;
+    nx.setNameError();
+    const refused = nx.finish();
+    try testing.expectEqual(@as(u16, 0), Header.parse(refused).?.an_count);
+    try testing.expectEqual(@as(u16, 3), Header.parse(refused).?.flags & 0x000F);
+}
+
+test "dns: a response stops when the buffer is full" {
+    const query = buildTestQuery();
+    // Room for the question and one A record, and not two.
+    var buf: [29 + 16]u8 = undefined;
+    var b = ResponseBuilder.init(&buf, &query).?;
+    try testing.expect(b.addA(60, .{ 1, 2, 3, 4 }));
+    try testing.expect(!b.addA(60, .{ 5, 6, 7, 8 }));
+    try testing.expectEqual(@as(u16, 1), Header.parse(b.finish()).?.an_count);
+
+    // And a buffer that cannot even hold the question is refused outright.
+    var tiny: [20]u8 = undefined;
+    try testing.expect(ResponseBuilder.init(&tiny, &query) == null);
+}
+
+test "dns: names go to the wire and come back" {
+    var wire: [64]u8 = undefined;
+    const n = encodeName(&wire, "a.example").?;
+    try testing.expectEqual(@as(usize, 11), n);
+    try testing.expectEqualSlices(u8, &.{ 1, 'a', 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0 }, wire[0..n]);
+
+    var back: [256]u8 = undefined;
+    const r = parseName(wire[0..n], 0, &back).?;
+    try testing.expectEqualStrings("a.example", back[0..r.len]);
+
+    // A label of its own is a name, and so is the root.
+    try testing.expectEqual(@as(usize, 3), encodeName(&wire, "a").?);
+    try testing.expectEqual(@as(usize, 1), encodeName(&wire, "").?);
+
+    // An empty label, a label past 63 bytes, and a name past the buffer are
+    // not names.
+    try testing.expect(encodeName(&wire, "a..b") == null);
+    var long: [80]u8 = [_]u8{'x'} ** 80;
+    try testing.expect(encodeName(&wire, &long) == null);
+    var small: [4]u8 = undefined;
+    try testing.expect(encodeName(&small, "example") == null);
+}
+
+test "dns: an SRV record's numbers and target, and a TXT record's strings" {
+    // Build a response by hand: SRV and TXT are what a resolver reads rather
+    // than what this builds, so the wire bytes come first.
+    var pkt: [128]u8 = [_]u8{0} ** 128;
+    const query = buildTestQuery();
+    @memcpy(pkt[0..query.len], &query);
+    writeU16(&pkt, 2, 0x8400);
+    writeU16(&pkt, 6, 2); // two answers
+
+    var at: usize = query.len;
+    // SRV: priority 10, weight 20, port 8080, target "svc.example"
+    pkt[at] = 0xC0;
+    pkt[at + 1] = HEADER_LEN;
+    writeU16(&pkt, at + 2, TYPE_SRV);
+    writeU16(&pkt, at + 4, CLASS_IN);
+    writeU32(&pkt, at + 6, 30);
+    var target: [32]u8 = undefined;
+    const tlen = encodeName(&target, "svc.example").?;
+    writeU16(&pkt, at + 10, @intCast(6 + tlen));
+    writeU16(&pkt, at + 12, 10);
+    writeU16(&pkt, at + 14, 20);
+    writeU16(&pkt, at + 16, 8080);
+    @memcpy(pkt[at + 18 ..][0..tlen], target[0..tlen]);
+    at += 18 + tlen;
+
+    // TXT: two strings in one record.
+    pkt[at] = 0xC0;
+    pkt[at + 1] = HEADER_LEN;
+    writeU16(&pkt, at + 2, TYPE_TXT);
+    writeU16(&pkt, at + 4, CLASS_IN);
+    writeU32(&pkt, at + 6, 30);
+    writeU16(&pkt, at + 10, 4 + 4);
+    pkt[at + 12] = 3;
+    @memcpy(pkt[at + 13 ..][0..3], "one");
+    pkt[at + 16] = 3;
+    @memcpy(pkt[at + 17 ..][0..3], "two");
+    at += 20;
+
+    var answers: [4]Answer = undefined;
+    try testing.expectEqual(@as(usize, 2), parseAnswers(pkt[0..at], &answers));
+
+    const srv = srvFields(&answers[0], pkt[0..at]).?;
+    try testing.expectEqual(@as(u16, 10), srv.priority);
+    try testing.expectEqual(@as(u16, 20), srv.weight);
+    try testing.expectEqual(@as(u16, 8080), srv.port);
+    var name: [256]u8 = undefined;
+    const len = srvTarget(&answers[0], pkt[0..at], &name).?;
+    try testing.expectEqualStrings("svc.example", name[0..len]);
+
+    var strings = txtStrings(&answers[1], pkt[0..at]).?;
+    try testing.expectEqualStrings("one", strings.next().?);
+    try testing.expectEqualStrings("two", strings.next().?);
+    try testing.expect(strings.next() == null);
+
+    // Asking the wrong record for either of them says no.
+    try testing.expect(srvFields(&answers[1], pkt[0..at]) == null);
+    try testing.expect(txtStrings(&answers[0], pkt[0..at]) == null);
 }
