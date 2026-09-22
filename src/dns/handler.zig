@@ -73,18 +73,30 @@ pub const Answer = struct {
     ipv6: [16]u8 = [_]u8{0} ** 16,
 };
 
-/// Parse a DNS name from wire format. Returns decoded name and bytes consumed.
+/// The longest name the wire format allows, dots included.
+const max_name_len = 255;
+
+/// Parse a DNS name from wire format. Returns decoded name and bytes
+/// consumed, or null for a name that is not one.
+///
+/// A compression pointer must point backwards. RFC 1035 4.1.4 says a pointer
+/// names a prior occurrence, and the rule is what makes this terminate: each
+/// jump moves strictly towards the front of the packet. Without it, a name
+/// that is a pointer to itself — two bytes anyone can send — is parsed until
+/// the machine is switched off.
 pub fn parseName(data: []const u8, offset: usize, out: []u8) ?struct { len: u8, consumed: usize } {
     var pos = offset;
     var out_pos: usize = 0;
     var consumed: usize = 0;
     var jumped = false;
+    var terminated = false;
 
     while (pos < data.len) {
         const label_len = data[pos];
 
         if (label_len == 0) {
             if (!jumped) consumed = pos + 1 - offset;
+            terminated = true;
             break;
         }
 
@@ -92,16 +104,22 @@ pub fn parseName(data: []const u8, offset: usize, out: []u8) ?struct { len: u8, 
         if ((label_len & 0xC0) == 0xC0) {
             if (pos + 1 >= data.len) return null;
             const ptr_offset = (@as(usize, label_len & 0x3F) << 8) | @as(usize, data[pos + 1]);
+            if (ptr_offset >= pos) return null;
             if (!jumped) consumed = pos + 2 - offset;
             jumped = true;
             pos = ptr_offset;
             continue;
         }
 
+        // The two other label types are reserved and have never been
+        // assigned, so a byte carrying one is not a name either.
+        if ((label_len & 0xC0) != 0) return null;
+
         // Regular label
         pos += 1;
         if (pos + label_len > data.len) return null;
         if (out_pos + label_len + 1 > out.len) return null;
+        if (out_pos + label_len + 1 > max_name_len) return null;
 
         if (out_pos > 0) {
             out[out_pos] = '.';
@@ -112,7 +130,10 @@ pub fn parseName(data: []const u8, offset: usize, out: []u8) ?struct { len: u8, 
         pos += label_len;
     }
 
-    if (consumed == 0 and !jumped) consumed = pos + 1 - offset;
+    // A name that runs off the end of the packet is a truncated name, not a
+    // short one: reporting it as parsed hands the caller a length that
+    // reaches past the data it came from.
+    if (!terminated) return null;
 
     return .{ .len = @intCast(out_pos), .consumed = consumed };
 }
@@ -624,4 +645,85 @@ test "DNS: handler static host" {
         .static_host => |addr| try testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 99 }, &addr),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "dns: a name that points at itself is not a name" {
+    // Two bytes: a compression pointer to its own offset. Following it was
+    // once an endless walk, which is a whole daemon stopped by a packet.
+    var pkt: [32]u8 = [_]u8{0} ** 32;
+    pkt[HEADER_LEN] = 0xC0;
+    pkt[HEADER_LEN + 1] = HEADER_LEN;
+    var out: [256]u8 = undefined;
+    try std.testing.expect(parseName(&pkt, HEADER_LEN, &out) == null);
+
+    // A pair of pointers that name each other, and a pointer that names
+    // something later in the packet, go the same way.
+    pkt[12] = 0xC0;
+    pkt[13] = 14;
+    pkt[14] = 0xC0;
+    pkt[15] = 12;
+    try std.testing.expect(parseName(&pkt, 12, &out) == null);
+
+    pkt[12] = 0xC0;
+    pkt[13] = 20;
+    pkt[20] = 0;
+    try std.testing.expect(parseName(&pkt, 12, &out) == null);
+}
+
+test "dns: a compressed name is read through its pointer" {
+    // "a.example" at offset 4, then "b" + a pointer to the "example" label.
+    var pkt: [64]u8 = [_]u8{0} ** 64;
+    pkt[4] = 1;
+    pkt[5] = 'a';
+    pkt[6] = 7;
+    @memcpy(pkt[7..14], "example");
+    pkt[14] = 0;
+    pkt[20] = 1;
+    pkt[21] = 'b';
+    pkt[22] = 0xC0;
+    pkt[23] = 6; // the "example" label
+
+    var out: [256]u8 = undefined;
+    const full = parseName(&pkt, 4, &out).?;
+    try std.testing.expectEqualStrings("a.example", out[0..full.len]);
+    try std.testing.expectEqual(@as(usize, 11), full.consumed);
+
+    const compressed = parseName(&pkt, 20, &out).?;
+    try std.testing.expectEqualStrings("b.example", out[0..compressed.len]);
+    // Two labels' worth of bytes plus the pointer, and nothing beyond it.
+    try std.testing.expectEqual(@as(usize, 4), compressed.consumed);
+}
+
+test "dns: a name is refused when it is too long, reserved or truncated" {
+    var out: [256]u8 = undefined;
+
+    // Five 63-byte labels and the dots between them are 319 bytes of name,
+    // which the wire format has no room for. (Four would be exactly 255,
+    // which it does.)
+    var long: [400]u8 = [_]u8{0} ** 400;
+    var pos: usize = 0;
+    for (0..5) |_| {
+        long[pos] = 63;
+        @memset(long[pos + 1 .. pos + 64], 'x');
+        pos += 64;
+    }
+    long[pos] = 0;
+    try std.testing.expect(parseName(&long, 0, &out) == null);
+    // Including for a caller whose buffer would have held it: the limit is
+    // the format's, not the buffer's.
+    var big: [512]u8 = undefined;
+    try std.testing.expect(parseName(&long, 0, &big) == null);
+
+    // A reserved label type (0x40 and 0x80 are neither a label nor a
+    // pointer).
+    var reserved: [8]u8 = [_]u8{0} ** 8;
+    reserved[0] = 0x40;
+    try std.testing.expect(parseName(&reserved, 0, &out) == null);
+    reserved[0] = 0x80;
+    try std.testing.expect(parseName(&reserved, 0, &out) == null);
+
+    // A name whose last label runs to the end of the packet with no root
+    // label after it.
+    var truncated: [4]u8 = .{ 3, 'a', 'b', 'c' };
+    try std.testing.expect(parseName(&truncated, 0, &out) == null);
 }
