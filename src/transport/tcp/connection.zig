@@ -262,17 +262,30 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     }
                     return .none;
                 },
+                // Both of these are waiting for one thing: the ACK of the
+                // FIN this side sent. They used to look for it by comparing
+                // the ACK to snd_nxt and nothing else, which misses an ACK
+                // that covers only the data before the FIN — and leaves the
+                // queue holding segments the peer already has, which poll()
+                // now retransmits forever while the FIN itself, further back
+                // in the queue, is never the one picked.
                 .last_ack => {
-                    if (flags.ack and seg_ack == self.sender.snd_nxt) {
-                        self.state = .closed;
-                        return .closed;
+                    if (flags.ack) {
+                        self.processAck(now_ms, seg_ack);
+                        if (self.sender.fin_acked) {
+                            self.state = .closed;
+                            return .closed;
+                        }
                     }
                     return .none;
                 },
                 .closing => {
-                    if (flags.ack and seg_ack == self.sender.snd_nxt) {
-                        self.state = .time_wait;
-                        self.sender.timer.setTimeWait(now_ms);
+                    if (flags.ack) {
+                        self.processAck(now_ms, seg_ack);
+                        if (self.sender.fin_acked) {
+                            self.state = .time_wait;
+                            self.sender.timer.setTimeWait(now_ms);
+                        }
                     }
                     return .none;
                 },
@@ -297,15 +310,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                         return self.abortClose();
                     }
 
-                    // SO_LINGER: if close requested with linger timeout>0, check deadline
-                    if (self.close_requested and self.linger_enabled and self.linger_ms > 0) {
-                        if (self.linger_deadline == 0) {
-                            self.linger_deadline = now_ms + self.linger_ms;
-                        }
-                        if (now_ms >= self.linger_deadline and self.send_buf_len > 0) {
-                            return self.abortClose();
-                        }
-                    }
+                    if (self.lingerExpired(now_ms)) return self.abortClose();
 
                     const pending = self.send_buf_len - self.send_buf_sent;
                     const has_fin = self.close_requested and pending == 0;
@@ -398,8 +403,28 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 // anything in these states — an unacked segment is dropped
                 // on the floor, and a fast retransmit asked for here is
                 // never served while nextPollAt keeps saying "poll me now".
-                .fin_wait_1, .closing, .last_ack => {
-                    return self.senderActionToOutput(self.sender.poll(now_ms, 0, false));
+                .fin_wait_1, .fin_wait_2, .closing, .last_ack => {
+                    if (self.lingerExpired(now_ms)) return self.abortClose();
+
+                    switch (self.senderActionToOutput(self.sender.poll(now_ms, 0, false))) {
+                        .none => {},
+                        else => |out| return out,
+                    }
+
+                    // The peer can still be sending: this side closed its
+                    // half, not the connection. Data that arrived after the
+                    // FIN reaches the application, and the ACK it is owed
+                    // only leaves from here — without this the peer
+                    // retransmits every segment until it gives up.
+                    if (self.receiver.consumeAckNeeded()) {
+                        return .{ .send = .{
+                            .flags = .{ .ack = true },
+                            .seq = self.sender.snd_nxt,
+                            .ack = self.receiver.rcv_nxt,
+                            .window = self.scaledWindow(),
+                        } };
+                    }
+                    return .none;
                 },
                 .time_wait => {
                     if (self.sender.timer.shouldFire(now_ms)) {
@@ -415,6 +440,17 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// Get the next time poll() should be called.
         pub fn nextPollAt(self: *const Self) ?u64 {
             return self.sender.nextPollAt();
+        }
+
+        /// SO_LINGER with a timeout: a close that asked to wait gives up
+        /// once its deadline passes with bytes still unacknowledged. The
+        /// deadline outlives established and close_wait, because the FIN
+        /// goes out as soon as everything is sent and what it is waiting for
+        /// is the acknowledgement.
+        fn lingerExpired(self: *Self, now_ms: u64) bool {
+            if (!self.close_requested or !self.linger_enabled or self.linger_ms == 0) return false;
+            if (self.linger_deadline == 0) self.linger_deadline = now_ms + self.linger_ms;
+            return now_ms >= self.linger_deadline and self.send_buf_len > 0;
         }
 
         /// Process an ACK and take what it acknowledged out of the send
@@ -1681,4 +1717,89 @@ test "Connection: a fast retransmit asked for after the FIN is served" {
     }
     try testing.expect(conn.sender.timer != .fast_retransmit);
     try testing.expect(conn.nextPollAt().? > 0);
+}
+
+test "Connection: in last_ack an ACK of the data leaves only the FIN to resend" {
+    var conn = makeEstablished();
+    // The peer half-closes, then this side sends and closes.
+    _ = conn.onSegment(10, .{ .fin = true, .ack = true }, 2001, 1001, 65535, &.{});
+    _ = conn.write("ABCD");
+    _ = conn.poll(11);
+    conn.close();
+    switch (conn.poll(12)) {
+        .send => |seg| try testing.expect(seg.flags.fin),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.last_ack, conn.state);
+    try testing.expectEqual(@as(usize, 2), conn.sender.retx_count);
+
+    // The peer acks the data but not the FIN. That has to be taken as the
+    // ACK it is: the data is no longer ours to resend, and the FIN is.
+    _ = conn.onSegment(13, .{ .ack = true }, 2001, 1005, 65535, &.{});
+    try testing.expectEqual(State.last_ack, conn.state);
+    try testing.expectEqual(@as(usize, 1), conn.sender.retx_count);
+    try testing.expectEqual(@as(u32, 1005), conn.sender.snd_una);
+
+    // So the retransmission is the FIN, rather than data the peer already
+    // has, on and on until the connection gives up.
+    switch (conn.poll(3013)) {
+        .send => |seg| {
+            try testing.expect(seg.flags.fin);
+            try testing.expectEqual(@as(u32, 1005), seg.seq);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // And the ACK of the FIN closes it.
+    _ = conn.onSegment(3014, .{ .ack = true }, 2001, 1006, 65535, &.{});
+    try testing.expectEqual(State.closed, conn.state);
+}
+
+test "Connection: data that arrives after our FIN is acknowledged" {
+    var conn = makeEstablished();
+    conn.close();
+    switch (conn.poll(10)) {
+        .send => |seg| try testing.expect(seg.flags.fin),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+
+    // The peer is still sending, and the application still reads.
+    // The peer's ISN is 2000, so its first byte is 2001.
+    _ = conn.onSegment(11, .{ .ack = true }, 2001, 1002, 65535, "hello");
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), conn.read(&buf));
+    try testing.expectEqualSlices(u8, "hello", buf[0..5]);
+
+    // The ACK it is owed can only come out of poll(). Without it the peer
+    // retransmits "hello" until it gives up.
+    switch (conn.poll(12)) {
+        .send => |seg| {
+            try testing.expect(seg.flags.ack);
+            try testing.expectEqual(@as(u32, 2006), seg.ack);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a lingering close gives up after its deadline" {
+    var conn = makeEstablished();
+    _ = conn.write("ABCD");
+    _ = conn.poll(10);
+    conn.setLinger(true, 100);
+    conn.close();
+    switch (conn.poll(11)) {
+        .send => |seg| try testing.expect(seg.flags.fin),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+
+    // The data is still unacknowledged when the deadline passes. The FIN
+    // goes out as soon as everything is sent, so the deadline is only ever
+    // reached from here.
+    switch (conn.poll(200)) {
+        .send => |seg| try testing.expect(seg.flags.rst),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.closed, conn.state);
 }
