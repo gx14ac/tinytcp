@@ -352,6 +352,14 @@ pub fn SenderWith(comptime cfg: Config) type {
         /// Process an incoming ACK.
         /// Returns the number of data bytes acknowledged (for buffer consumption).
         pub fn onAck(self: *Self, now_ms: u64, ack_seq: u32) usize {
+            // An ACK for bytes this side has not sent is not acceptable
+            // (RFC 9293 3.10.7.4). Acting on one drains the retransmit queue
+            // of everything it holds and reports those bytes to the send
+            // buffer as delivered, so anything actually in flight is
+            // forgotten and never sent again. It arrives from the network,
+            // which is reason enough to check it.
+            if (endpoint_mod.seqGt(ack_seq, self.snd_nxt)) return 0;
+
             // Ignore old/duplicate ACKs
             if (!endpoint_mod.seqGt(ack_seq, self.snd_una)) {
                 // Duplicate ACK
@@ -610,13 +618,17 @@ pub fn SenderWith(comptime cfg: Config) type {
         // -- Internal ring buffer operations --
 
         fn enqueue(self: *Self, seg: RetxSegment) void {
-            // poll() stops sending while the queue is full, so reaching here
-            // with no room means something emitted a segment behind its
-            // back. Dropping the oldest entry to make room is what this used
-            // to do, and it loses the bytes that entry was tracking.
-            std.debug.assert(self.retx_count < retx_queue_size);
             if (self.retx_count >= retx_queue_size) {
-                self.dequeue();
+                // Unreachable by design: poll() does not send while the
+                // queue is full, and trackSyn runs on a sender with an empty
+                // one. Both ways of making room are worse than stopping —
+                // dropping the oldest entry loses the bytes it was
+                // accounting for, dropping this one loses the bytes just
+                // counted as sent, and either way the send buffer never
+                // learns and everything after it goes out shifted. So this
+                // says so, in every build mode rather than only the ones
+                // that keep assertions.
+                @panic("tinytcp: retransmit queue overflow");
             }
             self.retx_queue[self.retx_tail] = seg;
             self.retx_tail = (self.retx_tail + 1) % retx_queue_size;

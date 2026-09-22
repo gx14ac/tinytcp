@@ -1803,3 +1803,24 @@ test "Connection: a lingering close gives up after its deadline" {
     }
     try testing.expectEqual(State.closed, conn.state);
 }
+
+test "Connection: an ACK for bytes we never sent is refused" {
+    var conn = makeEstablished();
+    _ = conn.write("ABCD");
+    _ = conn.poll(10);
+    try testing.expectEqual(@as(usize, 1), conn.sender.retx_count);
+    try testing.expectEqual(@as(u32, 1005), conn.sender.snd_nxt);
+
+    // Far ahead of anything on the wire. Taking it would empty the queue,
+    // hand the buffer back as delivered, and leave the segment in flight
+    // with nothing to resend it.
+    _ = conn.onSegment(11, .{ .ack = true }, 2000, 900_000, 65535, &.{});
+    try testing.expectEqual(@as(usize, 1), conn.sender.retx_count);
+    try testing.expectEqual(@as(u32, 1001), conn.sender.snd_una);
+    try testing.expectEqual(@as(usize, 4), conn.send_buf_len);
+
+    // The real ACK still works.
+    _ = conn.onSegment(12, .{ .ack = true }, 2000, 1005, 65535, &.{});
+    try testing.expectEqual(@as(usize, 0), conn.sender.retx_count);
+    try testing.expectEqual(@as(usize, 0), conn.send_buf_len);
+}
