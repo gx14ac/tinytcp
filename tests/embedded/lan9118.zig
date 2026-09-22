@@ -92,7 +92,10 @@ pub fn send(frame: []const u8) void {
     if (i < frame.len) {
         var word: u32 = 0;
         var j: u5 = 0;
-        while (i < frame.len) : ({ i += 1; j += 1; }) {
+        while (i < frame.len) : ({
+            i += 1;
+            j += 1;
+        }) {
             word |= @as(u32, frame[i]) << (@as(u5, j) * 8);
         }
         reg(TX_DATA_FIFO).* = word;

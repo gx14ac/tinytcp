@@ -86,7 +86,6 @@ fn buildEthHdr(out: []u8, dst: [6]u8, src: [6]u8, etype: u16) void {
     writeU16Big(out, 12, etype);
 }
 
-
 // --- ARP handler ---
 
 fn handleArp(frame: []const u8, tx_buf: []u8) ?usize {
