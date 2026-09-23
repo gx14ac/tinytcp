@@ -187,7 +187,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         // SYN queue count (incremental O(1) tracking)
         syn_queue_count: u16 = 0,
         // Accept queue limit (established connections waiting for app accept())
-        accept_queue_limit: u16 = 128,
+        accept_queue_limit: u16 = @min(128, max_conns),
         // Accept queue: ring buffer of connection indices ready for application
         accept_queue: [max_conns]u16 = undefined,
         accept_queue_head: usize = 0,
@@ -740,11 +740,12 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         fn raiseQueueLimits(self: *Self, backlog: u16) void {
             const limit = if (backlog == 0) 128 else backlog;
             self.syn_queue_limit = @max(self.syn_queue_limit, limit);
-            // The accept queue is one entry per slot and no more: what holds
-            // it inside the ring is that a connection waiting to be accepted
-            // has a slot, and there are max_conns of those. A backlog asking
-            // for more than the stack can hold would write past the ring on
-            // a stack whose slots outnumber nothing.
+            // The accept queue holds one entry per slot and no more, because
+            // a connection waiting to be accepted has a slot. The ring wraps
+            // either way, so a larger limit would not write past it — it
+            // would promise a backlog the stack has nowhere to put, and
+            // overwrite the oldest waiting connection with the newest. The
+            // limit says what the stack has.
             self.accept_queue_limit = @min(@max(self.accept_queue_limit, limit), max_conns);
         }
 
