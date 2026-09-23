@@ -800,11 +800,17 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// Dequeue the next established connection from the accept queue.
         /// Returns the connection index, or null if the queue is empty.
         pub fn accept(self: *Self) ?u16 {
-            if (self.accept_queue_count == 0) return null;
-            const idx = self.accept_queue[self.accept_queue_head];
-            self.accept_queue_head = (self.accept_queue_head + 1) % max_conns;
-            self.accept_queue_count -= 1;
-            return idx;
+            while (self.accept_queue_count > 0) {
+                const idx = self.accept_queue[self.accept_queue_head];
+                self.accept_queue_head = (self.accept_queue_head + 1) % max_conns;
+                self.accept_queue_count -= 1;
+                // A connection that ended before anyone accepted it is not
+                // one to hand out. Releasing a slot takes it out of this
+                // queue, so this is the second line of defence rather than
+                // the first.
+                if (self.conns[idx].active) return idx;
+            }
+            return null;
         }
 
         /// Enqueue a connection index into the accept queue.
@@ -1840,6 +1846,31 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             self.hashRemove(idx);
             self.conns[idx].active = false;
             self.active_count -|= 1;
+            // And out of the accept queue, if it was waiting there. The slot
+            // goes back to whoever asks for one next, and an index left
+            // behind would hand that new connection to a caller that asked
+            // about this one — or hand the same one out twice, once for each
+            // time the slot was queued.
+            self.dropFromAcceptQueue(@intCast(idx));
+        }
+
+        /// Take every entry for `conn_idx` out of the accept queue, keeping
+        /// what is left in the order it arrived.
+        fn dropFromAcceptQueue(self: *Self, conn_idx: u16) void {
+            var kept: usize = 0;
+            var read_at = self.accept_queue_head;
+            var write_at = self.accept_queue_head;
+            var i: usize = 0;
+            while (i < self.accept_queue_count) : (i += 1) {
+                const entry = self.accept_queue[read_at];
+                read_at = (read_at + 1) % max_conns;
+                if (entry == conn_idx) continue;
+                self.accept_queue[write_at] = entry;
+                write_at = (write_at + 1) % max_conns;
+                kept += 1;
+            }
+            self.accept_queue_tail = write_at;
+            self.accept_queue_count = kept;
         }
 
         /// Whether this slot is a handshake the SYN queue is counting.
@@ -4322,4 +4353,41 @@ test "FullStack: a connection aborted while opening gives its slot back" {
     _ = stack.injectPacket(3, pkt_buf[0..syn2_len]);
     try testing.expectEqual(@as(u16, 1), stack.active_count);
     try testing.expectEqual(@as(u16, 1), stack.syn_queue_count);
+}
+
+test "FullStack: a slot that ended before it was accepted is not handed out" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 10, 0, 0, 1 });
+    try testing.expect(stack.listen(80, 4));
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // One peer opens a connection and nobody accepts it yet.
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(1, pkt_buf[0..syn_len]);
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(2, pkt_buf[0..ack_len]);
+    try testing.expectEqual(@as(u16, 1), stack.active_count);
+
+    // Then it changes its mind, which frees the slot while its index is
+    // still sitting in the accept queue.
+    const rst_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .rst = true }, 0, &.{}, &pkt_buf);
+    _ = stack.injectPacket(3, pkt_buf[0..rst_len]);
+    try testing.expectEqual(@as(u16, 0), stack.active_count);
+
+    // Another peer takes the same slot.
+    const syn2_len = buildTcpPacket(.{ 10, 0, 0, 3 }, 40001, .{ 10, 0, 0, 1 }, 80, 2000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(4, pkt_buf[0..syn2_len]);
+    const syn_ack2 = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack2_len = buildTcpPacket(.{ 10, 0, 0, 3 }, 40001, .{ 10, 0, 0, 1 }, 80, 2001, syn_ack2.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(5, pkt_buf[0..ack2_len]);
+
+    // One connection is waiting, not two, and it is the one that is still
+    // here: the other peer's index would have been handed out first, and by
+    // then it named this connection.
+    const idx = stack.accept() orelse return error.NothingToAccept;
+    try testing.expectEqual(@as(u16, 40001), stack.conns[idx].id.remote_port);
+    try testing.expect(stack.accept() == null);
 }
