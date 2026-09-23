@@ -451,4 +451,7 @@ test "E2E: a transfer over a link that loses a fifth of it still arrives whole" 
     // this seed loses eight and repeats five
     try testing.expect(lossy.dropped >= 5);
     try testing.expect(lossy.duplicated >= 3);
+    // And what it lost, it chose to: a packet the other end had no room for
+    // would make this a test of something else.
+    try testing.expectEqual(@as(usize, 0), lossy.overflowed);
 }

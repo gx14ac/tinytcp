@@ -146,8 +146,24 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         /// Returns what this segment itself put in the buffer. Filling a gap
         /// can make more than that readable — the segments held behind it go
         /// in too — so this is not the amount the application can now read.
-        pub fn onSegment(self: *Self, seg_seq: u32, payload: []const u8) usize {
-            if (payload.len == 0) return 0;
+        pub fn onSegment(self: *Self, seg_seq: u32, whole_payload: []const u8) usize {
+            if (whole_payload.len == 0) return 0;
+
+            // Nothing follows a FIN: the peer said it had finished sending
+            // at that sequence number. A segment that reaches past it is
+            // taken as far as it goes and no further — and one that starts
+            // at or after it is only answered, since there is nothing in it
+            // this stream can use.
+            var payload = whole_payload;
+            if (self.fin_received) {
+                if (!seqLt(seg_seq, self.fin_seq)) {
+                    self.ack_needed = true;
+                    self.immediate_ack = true;
+                    return 0;
+                }
+                const room: usize = @intCast(@as(u32, @bitCast(@as(i32, @bitCast(self.fin_seq -% seg_seq)))));
+                if (payload.len > room) payload = payload[0..room];
+            }
 
             const seg_end = seg_seq +% @as(u32, @intCast(payload.len));
 
@@ -157,15 +173,6 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             // resending until it gives up on the connection (RFC 9293
             // 3.10.7.4).
             if (!self.inWindow(seg_seq, seg_end)) {
-                self.ack_needed = true;
-                self.immediate_ack = true;
-                return 0;
-            }
-
-            // Nothing follows a FIN: the peer said it had finished sending
-            // at that sequence number, so data at or past it is not part of
-            // this stream. Answer it as anything else outside the window.
-            if (self.fin_received and !seqLt(seg_seq, self.fin_seq)) {
                 self.ack_needed = true;
                 self.immediate_ack = true;
                 return 0;
@@ -209,27 +216,53 @@ pub fn ReceiverWith(comptime cfg: Config) type {
 
         /// Process a FIN.
         pub fn onFin(self: *Self, fin_seq: u32) void {
+            self.ack_needed = true;
+            self.immediate_ack = true;
+
+            // Behind what has already been taken, or past what the window
+            // will hold: not this stream's end. A FIN from before is one
+            // that has been consumed already and is being resent, and
+            // believing either would stop everything that comes after it.
+            if (seqLt(fin_seq, self.rcv_nxt)) return;
+            if (seqGt(fin_seq, self.rcv_nxt +% self.rcv_wnd)) return;
+
             self.fin_received = true;
             self.fin_seq = fin_seq;
+            // Whatever is held past where the stream ends is not part of it.
+            // Dropping it here is what keeps rcv_nxt from being carried past
+            // the FIN by a segment that arrived before it, which would leave
+            // the FIN unconsumed and every later segment refused.
+            self.dropOooPastFin();
+
             // If FIN is in-order, advance rcv_nxt
             if (fin_seq == self.rcv_nxt) {
                 self.takeFinSeq();
             }
-            self.ack_needed = true;
-            self.immediate_ack = true;
+        }
+
+        /// Forget what is held at or after the FIN, and cut short anything
+        /// that reaches into it.
+        fn dropOooPastFin(self: *Self) void {
+            for (&self.ooo) |*seg| {
+                if (!seg.active) continue;
+                if (!seqLt(seg.start, self.fin_seq)) {
+                    seg.active = false;
+                } else if (seqGt(seg.end, self.fin_seq)) {
+                    seg.end = self.fin_seq;
+                }
+            }
         }
 
         /// Count the sequence number a FIN takes up.
         ///
-        /// It takes a number without taking a byte, which breaks the rule
-        /// the rest of this relies on: that the byte at rcv_nxt is the one
-        /// at buf_len. Anything still held out of order is addressed by that
-        /// rule, and nothing can follow a FIN anyway, so it goes — rather
-        /// than being delivered one byte out of place, which is a byte of
-        /// whatever the buffer had in it.
+        /// It takes a number without taking a byte, which would break the
+        /// rule the rest of this relies on — that the byte at rcv_nxt is the
+        /// one at buf_len — for anything still held out of order. Nothing is
+        /// held by the time this runs: what was past the FIN went when the
+        /// FIN arrived, and what was before it has been delivered, which is
+        /// the only way rcv_nxt reached the FIN at all.
         fn takeFinSeq(self: *Self) void {
             self.rcv_nxt +%= 1;
-            for (&self.ooo) |*seg| seg.active = false;
         }
 
         /// Read data from the receive buffer (application call).
@@ -657,4 +690,54 @@ test "Receiver: a FIN does not shift what is held out of order" {
     const n = rx.read(&buf);
     try testing.expectEqual(@as(usize, 5), n);
     try testing.expectEqualStrings("abcde", buf[0..n]);
+}
+
+test "Receiver: a FIN from before the window does not close the stream" {
+    var rx = Receiver.init(1000, 65535);
+    try testing.expectEqual(@as(usize, 5), rx.onSegment(1001, "hello"));
+
+    // A sequence number from before anything this side has taken. Taking it
+    // at its word makes every later segment look like data past the end.
+    rx.onFin(500);
+    try testing.expect(rx.consumeAckNeeded());
+    try testing.expectEqual(@as(usize, 5), rx.onSegment(1006, "world"));
+
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 10), rx.read(&buf));
+    try testing.expectEqualStrings("helloworld", buf[0..10]);
+}
+
+test "Receiver: a segment that reaches past the FIN is taken only as far as it goes" {
+    var rx = Receiver.init(1000, 65535);
+    try testing.expectEqual(@as(usize, 5), rx.onSegment(1001, "abcde"));
+    rx.onFin(1006);
+    try testing.expectEqual(@as(u32, 1007), rx.rcv_nxt);
+
+    // Three of these bytes are past the end of the stream. The two that are
+    // not have already been taken, so nothing is delivered and nothing is
+    // written over.
+    try testing.expectEqual(@as(usize, 0), rx.onSegment(1004, "deXYZ"));
+    try testing.expectEqual(@as(u32, 1007), rx.rcv_nxt);
+
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5), rx.read(&buf));
+    try testing.expectEqualStrings("abcde", buf[0..5]);
+}
+
+test "Receiver: a FIN behind what is already held still closes the stream" {
+    var rx = Receiver.init(1000, 65535);
+
+    // Data arrives past a gap, and then the FIN turns out to be in the gap:
+    // what is held cannot be part of this stream after all. Keeping it
+    // carries rcv_nxt past the FIN when the gap closes, and then the FIN is
+    // never reached and every later segment is refused — a receiver that
+    // never finishes and never takes anything again.
+    try testing.expectEqual(@as(usize, 0), rx.onSegment(1005, "ZZZZZ"));
+    rx.onFin(1005);
+    try testing.expectEqual(@as(usize, 4), rx.onSegment(1001, "abcd"));
+    try testing.expectEqual(@as(u32, 1006), rx.rcv_nxt); // the FIN was taken
+
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 4), rx.read(&buf));
+    try testing.expectEqualStrings("abcd", buf[0..4]);
 }
