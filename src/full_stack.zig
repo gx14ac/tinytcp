@@ -187,7 +187,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         // SYN queue count (incremental O(1) tracking)
         syn_queue_count: u16 = 0,
         // Accept queue limit (established connections waiting for app accept())
-        accept_queue_limit: u16 = 128,
+        accept_queue_limit: u16 = @min(128, max_conns),
         // Accept queue: ring buffer of connection indices ready for application
         accept_queue: [max_conns]u16 = undefined,
         accept_queue_head: usize = 0,
@@ -740,7 +740,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         fn raiseQueueLimits(self: *Self, backlog: u16) void {
             const limit = if (backlog == 0) 128 else backlog;
             self.syn_queue_limit = @max(self.syn_queue_limit, limit);
-            self.accept_queue_limit = @max(self.accept_queue_limit, limit);
+            // The accept queue holds one entry per slot and no more, because
+            // a connection waiting to be accepted has a slot. The ring wraps
+            // either way, so a larger limit would not write past it — it
+            // would promise a backlog the stack has nowhere to put, and
+            // overwrite the oldest waiting connection with the newest. The
+            // limit says what the stack has.
+            self.accept_queue_limit = @min(@max(self.accept_queue_limit, limit), max_conns);
         }
 
         /// Stop listening on a port and give its slot back. Returns false if
@@ -4390,4 +4396,19 @@ test "FullStack: a slot that ended before it was accepted is not handed out" {
     const idx = stack.accept() orelse return error.NothingToAccept;
     try testing.expectEqual(@as(u16, 40001), stack.conns[idx].id.remote_port);
     try testing.expect(stack.accept() == null);
+}
+
+test "FullStack: a backlog larger than the stack does not promise more than it has" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 10, 0, 0, 1 });
+
+    // A listener asking for a hundred on a stack with four slots: the queue
+    // it would fill has four places in it.
+    try testing.expect(stack.listen(80, 100));
+    try testing.expect(stack.accept_queue_limit <= 4);
+
+    // And the SYN queue, which is counted rather than stored, is not held
+    // down by the number of slots: it starts at 128 and a listener can only
+    // raise it.
+    try testing.expect(stack.syn_queue_limit >= 100);
 }
