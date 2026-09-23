@@ -148,8 +148,16 @@ pub fn ReceiverWith(comptime cfg: Config) type {
 
             const seg_end = seg_seq +% @as(u32, @intCast(payload.len));
 
-            // Check if segment is within receive window
-            if (!self.inWindow(seg_seq, seg_end)) return 0;
+            // Outside the window, which includes everything already
+            // received: answer it. The peer sent this because it has not
+            // heard the acknowledgement for it, and saying nothing leaves it
+            // resending until it gives up on the connection (RFC 9293
+            // 3.10.7.4).
+            if (!self.inWindow(seg_seq, seg_end)) {
+                self.ack_needed = true;
+                self.immediate_ack = true;
+                return 0;
+            }
 
             // Case 1: segment starts at rcv_nxt (in-order)
             if (seg_seq == self.rcv_nxt) {
@@ -164,7 +172,15 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             if (seqLt(seg_seq, self.rcv_nxt)) {
                 // Calculate how much of this segment is new
                 const overlap = @as(usize, @intCast(@as(u32, @bitCast(@as(i32, @bitCast(self.rcv_nxt -% seg_seq))))));
-                if (overlap >= payload.len) return 0; // entirely old
+                if (overlap >= payload.len) {
+                    // All of it arrived before. The acknowledgement that
+                    // would have said so is what went missing, so send it
+                    // again rather than letting the peer wear the connection
+                    // out resending data this side already has.
+                    self.ack_needed = true;
+                    self.immediate_ack = true;
+                    return 0;
+                }
                 const new_data = payload[overlap..];
                 const delivered = self.deliverInOrder(new_data);
                 _ = self.reassemble();
@@ -568,4 +584,29 @@ test "Receiver: a segment with nowhere to go is not remembered" {
     var buf: [16]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), rx.read(&buf));
     try testing.expectEqualStrings("abcd", buf[0..4]);
+}
+
+test "Receiver: data that arrived before is acknowledged again" {
+    var rx = Receiver.init(1000, 65535);
+    try testing.expectEqual(@as(usize, 5), rx.onSegment(1001, "hello"));
+    try testing.expect(rx.consumeAckNeeded());
+
+    // The peer sends it again, which it only does when it did not hear the
+    // acknowledgement. Saying nothing leaves it resending until it gives up
+    // on the connection.
+    try testing.expectEqual(@as(usize, 0), rx.onSegment(1001, "hello"));
+    try testing.expect(rx.consumeAckNeeded());
+
+    // And something from before the window entirely, which is the same
+    // situation seen from further back.
+    try testing.expectEqual(@as(usize, 0), rx.onSegment(900, "old"));
+    try testing.expect(rx.consumeAckNeeded());
+
+    // Half of it new: the new half is taken, and it is acknowledged either
+    // way.
+    try testing.expectEqual(@as(usize, 3), rx.onSegment(1003, "llo123"));
+    try testing.expect(rx.consumeAckNeeded());
+    var buf: [16]u8 = undefined;
+    try testing.expectEqual(@as(usize, 8), rx.read(&buf));
+    try testing.expectEqualStrings("hello123", buf[0..8]);
 }

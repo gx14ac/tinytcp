@@ -404,12 +404,12 @@ test "E2E: multiple connections" {
     try testing.expect(server.accept() != null);
 }
 
-test "E2E: a transfer over a link that loses a tenth of it still arrives whole" {
+test "E2E: a transfer over a link that loses a fifth of it still arrives whole" {
     var client_link = link_mod.ChannelEndpoint.init();
     var server_link = link_mod.ChannelEndpoint.init();
     var client = FullStack.init(&client_link, client_addr);
     var server = FullStack.init(&server_link, server_addr);
-    var lossy = LossyLink.init(0x10551055, 12, 6);
+    var lossy = LossyLink.init(0x10551055, 20, 10);
 
     _ = server.listen(80, 16);
     const c_idx = client.connect(0, server_addr, 80, 5010).?;
@@ -438,7 +438,8 @@ test "E2E: a transfer over a link that loses a tenth of it still arrives whole" 
     try testing.expectEqualSlices(u8, &send_data, recv_data[0..received]);
 
     // And the link really did lose and repeat things, rather than the run
-    // happening to be a clean one: this seed loses four and repeats four.
-    try testing.expect(lossy.dropped >= 3);
+    // happening to be a clean one.
+    // this seed loses eight and repeats five
+    try testing.expect(lossy.dropped >= 5);
     try testing.expect(lossy.duplicated >= 3);
 }
