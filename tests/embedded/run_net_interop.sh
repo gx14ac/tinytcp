@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 gx14ac
+# SPDX-License-Identifier: Apache-2.0
+
 # QEMU + TAP network interop test for tinytcp.
 #
 # Sets up a TAP device, launches QEMU with LAN9118 NIC, then tests

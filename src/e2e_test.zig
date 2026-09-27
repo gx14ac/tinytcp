@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-End Tests — Real packet exchange between two FullStack instances.
 //
 // Two stacks (client: 10.0.0.1, server: 10.0.0.2) are wired back-to-back

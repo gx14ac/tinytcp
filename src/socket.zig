@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Socket API — POSIX-like socket interface over the tinytcp stack.
 //
 // Provides TcpSocket and UdpSocket with familiar semantics:

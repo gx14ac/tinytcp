@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // FullStack: End-to-end integrated TCP/IP stack.
 //
 // Connects all layers into a working packet pipeline:

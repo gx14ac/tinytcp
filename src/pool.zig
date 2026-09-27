@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Fixed-size buffer pool for zero-allocation packet processing.
 //
 // Pre-allocates a fixed number of packet buffers at init time.

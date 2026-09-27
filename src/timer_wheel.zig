@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Timer wheel: efficient timer management for many TCP connections.
 //
 // Sans-IO, fixed capacity (comptime), O(1) schedule/cancel.

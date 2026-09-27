@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // GSO (Generic Segmentation Offload).
 //
 // Accepts large writes from the transport layer and defers segmentation

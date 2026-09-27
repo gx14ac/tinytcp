@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TCP Endpoint: State machine for a single TCP connection.
 //
 // Implements the core TCP state transitions (RFC 9293):

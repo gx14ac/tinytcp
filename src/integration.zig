@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Integration: demonstrates how to combine FullStack + Forwarder + DNS.
 //
 // This module shows the pattern for building a full userspace TCP/IP stack

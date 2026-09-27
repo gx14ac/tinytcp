@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // DNS handler: query/response parsing, split DNS, caching, response mapping.
 //
 // Sans-IO: parses and transforms DNS wire-format data, no network I/O.

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TUN interop test server — Linux /dev/net/tun version.
 //
 // Creates tun0, assigns 10.99.0.2/24, runs tinytcp as echo server.

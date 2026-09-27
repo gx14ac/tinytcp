@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // BBRv1 Congestion Control (draft-cardwell-iccrg-bbr-congestion-control).
 //
 // Model-based congestion control that estimates:

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // SYN Cookies (RFC 4987): Stateless SYN flood defense.
 //
 // When the listen backlog is near full, instead of allocating connection state

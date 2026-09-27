@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Comptime configuration for tinytcp stack.
 //
 // All buffer sizes, queue depths, and feature knobs are parameterized here.

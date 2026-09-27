@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Bare-metal smoke test for tinytcp on ARM Cortex-M (QEMU semihosting).
 //
 // Runs a FullStack E2E test (TCP handshake + data transfer) entirely in-memory

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // SMSC LAN9118 Ethernet controller driver for QEMU MPS2-AN385.
 //
 // Minimal bare-metal driver supporting basic TX/RX of Ethernet frames.

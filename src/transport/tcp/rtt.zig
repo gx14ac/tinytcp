@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // RTT Estimator (RFC 6298).
 //
 // Maintains SRTT, RTTVAR, and computes RTO.

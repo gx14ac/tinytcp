@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // DHCP Client (RFC 2131).
 //
 // Implements the DHCP state machine for automatic IPv4 address configuration:

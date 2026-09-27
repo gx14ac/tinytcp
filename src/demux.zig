@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Transport Demultiplexer: routes inbound packets to the correct endpoint
 // based on 4-tuple (src_addr, src_port, dst_addr, dst_port) or 2-tuple (dst_port).
 //

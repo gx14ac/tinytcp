@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // IPv6 header parser (RFC 8200).
 // Fixed 40-byte header, extension headers not parsed (treated as payload).
 

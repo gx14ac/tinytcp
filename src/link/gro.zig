@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // GRO (Generic Receive Offload).
 //
 // Coalesces consecutive TCP segments from the same flow into a single

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Embedded TCP server — minimal RAM footprint for bare-metal / WASM.
 //
 // Demonstrates:

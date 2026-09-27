@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Wire-format header parsers for IP/TCP/UDP/ICMP.
 // All parsers work on borrowed byte slices — zero allocation, zero copy.
 

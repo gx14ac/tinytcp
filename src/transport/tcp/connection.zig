@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TCP Connection: full-featured TCP socket combining Sender + Receiver + state machine.
 //
 // This module integrates all TCP sub-components:

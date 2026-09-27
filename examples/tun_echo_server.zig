@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TUN echo server: tinytcp on a real macOS utun device.
 //
 // Creates a utun, assigns an IP, and runs a TCP echo server.

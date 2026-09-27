@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // NDP (Neighbor Discovery Protocol, RFC 4861).
 //
 // Implements IPv6 neighbor resolution (replaces ARP for IPv6):

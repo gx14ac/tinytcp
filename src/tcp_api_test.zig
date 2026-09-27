@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // End-to-End tests for the high-level Tcp API (Listener + Stream).
 //
 // Validates that Tcp.Listener / Tcp.Stream work correctly over real

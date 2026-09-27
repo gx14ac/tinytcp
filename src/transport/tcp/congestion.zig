@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Congestion Control for TCP.
 //
 // Implements pluggable congestion control via tagged union.
