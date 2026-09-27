@@ -1003,7 +1003,35 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             if (!slot.active) return false;
 
             // Build and send immediately
-            self.emitUdpPacket(slot.ep.local_port, dst_addr, dst_port, data);
+            self.emitUdpPacket(self.local_addr, slot.ep.local_port, dst_addr, dst_port, data);
+            return true;
+        }
+
+        /// Send a UDP datagram carrying a source address and port of the
+        /// caller's choosing, rather than this stack's own.
+        ///
+        /// For a relay. When this stack forwards a datagram on somebody
+        /// else's behalf — to a subnet it routes for, or out to the
+        /// internet as an exit node — the answer has to come back from the
+        /// address and port the sender wrote to, not from the stack's
+        /// overlay address. A sender whose socket is connected, which is
+        /// what a DNS resolver and most UDP clients use, drops anything
+        /// from a different source; an unconnected one accepts it and
+        /// hides the bug.
+        pub fn udpSendFrom(
+            self: *Self,
+            ep_idx: u16,
+            src_addr: [4]u8,
+            src_port: u16,
+            dst_addr: [4]u8,
+            dst_port: u16,
+            data: []const u8,
+        ) bool {
+            if (ep_idx >= max_udp_endpoints) return false;
+            const slot = &self.udp_eps[ep_idx];
+            if (!slot.active) return false;
+
+            self.emitUdpPacket(src_addr, src_port, dst_addr, dst_port, data);
             return true;
         }
 
@@ -1021,7 +1049,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             if (ep_idx >= max_udp_endpoints) return false;
             const slot = &self.udp_eps[ep_idx];
             if (!slot.active or !slot.ep.connected) return false;
-            self.emitUdpPacket(slot.ep.local_port, slot.ep.remote_addr, slot.ep.remote_port, data);
+            self.emitUdpPacket(self.local_addr, slot.ep.local_port, slot.ep.remote_addr, slot.ep.remote_port, data);
             return true;
         }
 
@@ -1413,7 +1441,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             return .none;
         }
 
-        fn emitUdpPacket(self: *Self, src_port: u16, dst_addr: [4]u8, dst_port: u16, data: []const u8) void {
+        fn emitUdpPacket(self: *Self, src_addr: [4]u8, src_port: u16, dst_addr: [4]u8, dst_port: u16, data: []const u8) void {
             const udp_len: u16 = @intCast(udp_header.header_len + data.len);
             const total_len: u16 = 20 + udp_len;
 
@@ -1427,7 +1455,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             self.ip_id_counter +%= 1;
             ip_hdr.setTtl(64);
             ip_hdr.setProtocol(.udp);
-            ip_hdr.setSrcAddr(self.local_addr);
+            ip_hdr.setSrcAddr(src_addr);
             ip_hdr.setDstAddr(dst_addr);
             ip_hdr.computeChecksum();
 
@@ -1448,7 +1476,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             udp_seg[7] = 0;
             {
                 const cksum_mod = @import("checksum.zig");
-                const ph = cksum_mod.pseudoHeaderIpv4(self.local_addr, dst_addr, 17, udp_len);
+                const ph = cksum_mod.pseudoHeaderIpv4(src_addr, dst_addr, 17, udp_len);
                 const raw = cksum_mod.finish(cksum_mod.accumulate(ph, udp_seg));
                 const cksum: u16 = if (raw == 0) 0xFFFF else raw;
                 std.mem.writeInt(u16, udp_seg[6..8], cksum, .big);
@@ -4411,4 +4439,43 @@ test "FullStack: a backlog larger than the stack does not promise more than it h
     // down by the number of slots: it starts at 128 and a listener can only
     // raise it.
     try testing.expect(stack.syn_queue_limit >= 100);
+}
+
+test "FullStack: udpSendFrom carries the source the caller asked for" {
+    // A relay's answer has to come back from the address and port the
+    // sender wrote to, not from this stack's own overlay address. A
+    // connected UDP socket — a DNS resolver, most UDP clients — drops
+    // anything from a different source.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 100, 64, 0, 1 });
+
+    const ep = stack.udpBind(0).?;
+    const peer: [4]u8 = .{ 100, 64, 0, 9 };
+    const behind: [4]u8 = .{ 192, 168, 1, 5 };
+
+    try testing.expect(stack.udpSendFrom(ep, behind, 53, peer, 40000, "answer"));
+    try testing.expectEqual(@as(usize, 1), link_ep.outboundCount());
+
+    var out_buf: [1500]u8 = undefined;
+    const raw = link_ep.readOutbound(&out_buf).?;
+    try testing.expectEqualSlices(u8, &behind, raw[12..16]);
+    try testing.expectEqualSlices(u8, &peer, raw[16..20]);
+    try testing.expectEqual(@as(u16, 53), std.mem.readInt(u16, raw[20..22], .big));
+    try testing.expectEqual(@as(u16, 40000), std.mem.readInt(u16, raw[22..24], .big));
+    try testing.expectEqualStrings("answer", raw[28..]);
+
+    // The checksums have to follow the address, or the peer's stack drops
+    // the datagram before anything looks at it.
+    const cksum_mod = @import("checksum.zig");
+    try testing.expectEqual(@as(u16, 0xFFFF), cksum_mod.finish(cksum_mod.accumulate(0, raw[0..20])) ^ 0xFFFF);
+    {
+        const udp_len: u16 = @intCast(raw.len - 20);
+        const ph = cksum_mod.pseudoHeaderIpv4(behind, peer, 17, udp_len);
+        try testing.expectEqual(@as(u16, 0), cksum_mod.finish(cksum_mod.accumulate(ph, raw[20..])));
+    }
+
+    // And the ordinary send still speaks for this stack.
+    try testing.expect(stack.udpSendTo(ep, peer, 40000, "mine"));
+    const own = link_ep.readOutbound(&out_buf).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 100, 64, 0, 1 }, own[12..16]);
 }
