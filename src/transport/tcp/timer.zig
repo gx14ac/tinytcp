@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TCP Timer state machine.
 //
 // Manages retransmission, delayed ACK, keepalive, and TIME-WAIT timers.

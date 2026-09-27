@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // FlowTable: NAT/connection tracking table for TCP/UDP flows.
 //
 // Each flow is identified by a 5-tuple (src_ip, dst_ip, src_port, dst_port, proto)

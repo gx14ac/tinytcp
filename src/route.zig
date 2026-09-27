@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Route table: longest-prefix match routing for IP forwarding.
 //
 // Sans-IO, fixed capacity (comptime), supports IPv4 and IPv6.

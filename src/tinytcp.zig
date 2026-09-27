@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // tinytcp — Sans-IO userspace TCP/IP stack.
 //
 // Zero-allocation data path, comptime polymorphism, single-threaded event loop design.

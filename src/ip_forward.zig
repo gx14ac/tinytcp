@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // IP Forwarding — Layer 3 packet forwarding between interfaces.
 //
 // Sans-IO: evaluates forwarding decisions; caller performs actual packet I/O.

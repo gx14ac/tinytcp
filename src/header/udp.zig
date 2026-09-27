@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // UDP header parser/serializer (RFC 768).
 // Simple 8-byte fixed header.
 

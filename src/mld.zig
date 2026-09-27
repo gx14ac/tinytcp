@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // MLD — Multicast Listener Discovery for IPv6 (RFC 2710 MLDv1, RFC 3810 MLDv2).
 //
 // Sans-IO: caller drives with timestamps and polls for output packets.

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Forwarder: L4 packet forwarding engine.
 //
 // Routes packets between the WireGuard tunnel (virtual addresses)

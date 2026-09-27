@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // QEMU + TAP network interop test for tinytcp.
 //
 // Runs tinytcp as a bare-metal TCP echo server on QEMU mps2-an385 with

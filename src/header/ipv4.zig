@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // IPv4 header parser/serializer (RFC 791).
 // Zero-copy: works on borrowed byte slices.
 

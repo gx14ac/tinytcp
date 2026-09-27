@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TCP header parser/serializer (RFC 9293).
 // Supports parsing of common options: MSS, Window Scale, SACK Permitted, SACK, Timestamps.
 

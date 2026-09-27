@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // LinkEndpoint: comptime interface for injecting/extracting raw IP packets.
 //
 // Implementations:

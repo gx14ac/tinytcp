@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Raw IP Socket Endpoint.
 //
 // Allows sending/receiving raw IP packets for custom protocols (e.g., OSPF, GRE).

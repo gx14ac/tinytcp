@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // tinytcp demo: two TCP stacks connected back-to-back
 //
 // Demonstrates:

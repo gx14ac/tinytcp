@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // UDP Endpoint: connectionless datagram send/receive.
 //
 // Sans-IO: caller injects received datagrams and polls for outbound.

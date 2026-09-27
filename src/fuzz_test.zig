@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Fuzz tests for tinytcp header parsers.
 // Ensures no crashes on arbitrary byte input.
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Connection Tracking (conntrack) — Stateful packet filter layer.
 //
 // Tracks TCP/UDP connection state and auto-allows return traffic for

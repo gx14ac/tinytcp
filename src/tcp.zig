@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // High-level TCP API — Listener, Stream, and Server.
 //
 // All types are accessed via Stack: tinytcp.Stack(N) re-exports them as

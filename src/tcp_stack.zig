@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TcpStack: integrates TCP Connection management with the Stack.
 //
 // Manages a pool of TCP connections, dispatches inbound segments,

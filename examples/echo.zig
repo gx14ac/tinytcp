@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TCP echo server — demonstrates the high-level Server API.
 //
 // Two stacks (client + server) connected via virtual link.

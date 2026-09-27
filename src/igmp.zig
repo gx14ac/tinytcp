@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // IGMP — Internet Group Management Protocol (RFC 2236 IGMPv2, RFC 3376 IGMPv3).
 //
 // Sans-IO: caller drives with timestamps and polls for output packets.

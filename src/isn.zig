@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Secure Initial Sequence Number generation (RFC 6528).
 //
 // ISN = hash(src_addr, dst_addr, src_port, dst_port, secret) + clock_based_offset

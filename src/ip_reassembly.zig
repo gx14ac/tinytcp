@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // IPv4 Fragment Reassembly (RFC 791, RFC 815).
 //
 // Reassembles fragmented IPv4 packets by tracking fragments per (src, dst, id, proto).

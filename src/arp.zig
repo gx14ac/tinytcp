@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // ARP (Address Resolution Protocol, RFC 826).
 //
 // Maintains an IPv4 → MAC address mapping table and handles ARP request/reply.

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // SLAAC (Stateless Address Autoconfiguration, RFC 4862).
 //
 // Auto-configures IPv6 addresses from Router Advertisements:

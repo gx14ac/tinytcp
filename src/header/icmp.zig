@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // ICMPv4/v6 header parser (RFC 792, RFC 4443).
 // Minimal parser for echo request/reply and error messages.
 

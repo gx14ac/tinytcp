@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // CUBIC Congestion Control (RFC 8312).
 //
 // CUBIC is the default congestion control algorithm in Linux.

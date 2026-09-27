@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // PacketBuf: Zero-copy packet buffer with headroom for prepending headers.
 //
 // Inspired by gVisor's PacketBuffer and Linux sk_buff.

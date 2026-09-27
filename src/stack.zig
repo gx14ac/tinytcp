@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // Stack: Central orchestrator for the TCP/IP stack.
 //
 // Sans-IO design: the stack itself performs no I/O.

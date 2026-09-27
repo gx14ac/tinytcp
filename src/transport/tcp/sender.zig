@@ -1,3 +1,6 @@
+// Copyright (c) 2026 gx14ac
+// SPDX-License-Identifier: Apache-2.0
+
 // TCP Sender: manages the send-side of a TCP connection.
 //
 // Responsibilities:
