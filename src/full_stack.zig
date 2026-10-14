@@ -249,6 +249,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         egress_link: ?*LinkT = null,
 
         pub fn init(link_ep: *LinkT, local_addr: [4]u8) Self {
+            if (comptime chunked) @compileError("a stack with conn_chunk set takes its slots from an allocator: initAlloc");
             return Self{
                 .link = link_ep,
                 .local_addr = local_addr,
@@ -256,6 +257,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         pub fn initWithSecret(link_ep: *LinkT, local_addr: [4]u8, secret: [16]u8) Self {
+            if (comptime chunked) @compileError("a stack with conn_chunk set takes its slots from an allocator: initAlloc");
             return Self{
                 .link = link_ep,
                 .local_addr = local_addr,
@@ -312,6 +314,35 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// How many slots exist, for a caller walking them with slotAt.
         pub fn slotCount(self: *const Self) usize {
             return self.slots_ready;
+        }
+
+        /// Give back the chunks at the end that hold no connection, keeping
+        /// the first. Returns how many went back.
+        ///
+        /// For a caller to run now and then — not every poll: a stack going
+        /// back and forth across a chunk boundary would allocate and free
+        /// one each time. Only the end goes, so every slot that stays keeps
+        /// its index, and allocSlot fills from the front, so after a burst
+        /// the end is what empties. A connection left near the end holds its
+        /// chunk, and every one before it, until it closes. An index into a
+        /// chunk that went back reads as no connection (liveSlot), as one
+        /// that was closed does.
+        pub fn shrinkSlots(self: *Self) usize {
+            if (comptime !chunked) return 0;
+            const a = self.allocator orelse return 0;
+            var released: usize = 0;
+            while (self.slots_ready > conn_chunk) {
+                const last = self.slots_ready / conn_chunk - 1;
+                const chunk = self.conns[last].?;
+                for (chunk) |*slot| {
+                    if (slot.active) return released;
+                }
+                a.destroy(chunk);
+                self.conns[last] = null;
+                self.slots_ready -= conn_chunk;
+                released += 1;
+            }
+            return released;
         }
 
         /// One more chunk of slots, all free. False when the stack is at
@@ -4690,4 +4721,73 @@ test "FullStack chunked: an allocator that says no drops the SYN, and nothing el
     try testing.expectEqual(@as(usize, 16), stack.slotCount());
     // What it had still works.
     try testing.expectEqual(tcp_connection.State.established, stack.connState(0).?);
+}
+
+/// The client at 10.0.0.2:`port` resets its connection.
+fn chunkedReset(stack: *ChunkedStack, link_ep: *link_mod.ChannelEndpoint, port: u16) void {
+    var pkt: [128]u8 = undefined;
+    const rst_len = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 1001, 0, .{ .rst = true }, 0, &.{}, &pkt);
+    _ = stack.injectPacket(0, pkt[0..rst_len]);
+    var out: [1600]u8 = undefined;
+    while (link_ep.outboundCount() > 0) _ = link_ep.readOutbound(&out);
+}
+
+test "FullStack chunked: the empty chunks at the end go back, and the first stays" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: ChunkedStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{4} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 128);
+
+    for (0..40) |i| _ = try chunkedHandshake(&stack, &link_ep, @intCast(9000 + i));
+    try testing.expectEqual(@as(usize, 48), stack.slotCount());
+    // Nothing goes while anything is open at the end.
+    try testing.expectEqual(@as(usize, 0), stack.shrinkSlots());
+
+    for (0..40) |i| chunkedReset(&stack, &link_ep, @intCast(9000 + i));
+    try testing.expectEqual(@as(usize, 2), stack.shrinkSlots());
+    try testing.expectEqual(@as(usize, 16), stack.slotCount());
+    // Asked again, there is nothing more to give.
+    try testing.expectEqual(@as(usize, 0), stack.shrinkSlots());
+
+    // And it grows again when it has to.
+    for (0..17) |i| _ = try chunkedHandshake(&stack, &link_ep, @intCast(9100 + i));
+    try testing.expectEqual(@as(usize, 32), stack.slotCount());
+}
+
+test "FullStack chunked: one connection near the end keeps its chunk, and an old index reads as nothing" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: ChunkedStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{5} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 128);
+
+    var idx = [_]u16{0} ** 40;
+    for (0..40) |i| idx[i] = try chunkedHandshake(&stack, &link_ep, @intCast(9200 + i));
+    // Everything closes but one connection in the third chunk.
+    var kept: usize = 0;
+    for (0..40) |i| {
+        if (idx[i] >= 32 and kept == 0) {
+            kept = i;
+            continue;
+        }
+        chunkedReset(&stack, &link_ep, @intCast(9200 + i));
+    }
+    try testing.expectEqual(@as(usize, 0), stack.shrinkSlots());
+    try testing.expectEqual(@as(usize, 48), stack.slotCount());
+    try testing.expectEqual(tcp_connection.State.established, stack.connState(idx[kept]).?);
+
+    // It closes, and both chunks after the first go.
+    chunkedReset(&stack, &link_ep, @intCast(9200 + kept));
+    try testing.expectEqual(@as(usize, 2), stack.shrinkSlots());
+
+    // Its index is past what exists now: nothing there, and nothing breaks.
+    const old = idx[kept];
+    try testing.expect(old >= stack.slotCount());
+    try testing.expectEqual(@as(?tcp_connection.State, null), stack.connState(old));
+    try testing.expectEqual(@as(?ConnId, null), stack.connId(old));
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), stack.read(old, &buf));
+    try testing.expectEqual(@as(usize, 0), stack.write(old, "late"));
+    stack.close(old);
 }
