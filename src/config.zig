@@ -52,6 +52,17 @@ pub const Config = struct {
     /// carries the array and nothing else.
     max_pending_syns: usize = 16,
 
+    /// Connection slots allocated this many at a time, as they are needed,
+    /// instead of all of them inside the stack. 0 keeps every slot inline.
+    ///
+    /// A slot is the size of a connection — 100KiB with the default
+    /// buffers — so the inline array is max_conns of them whether or not
+    /// anything connects. In chunks, a stack that is allowed thousands of
+    /// connections holds only as many as it has had at once, rounded up to
+    /// a chunk. The chunks come from the allocator the stack is given
+    /// (initAlloc), and go back at deinit.
+    conn_chunk: usize = 0,
+
     /// Minimal embedded profile: ~4KB per connection.
     pub const embedded_minimal = Config{
         .send_buf_size = 1024,

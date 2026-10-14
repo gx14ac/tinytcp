@@ -176,7 +176,23 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         const hash_capacity = if (use_hash_index) max_conns * 2 else 0;
         const empty_slot: u16 = @intCast(max_conns);
 
-        conns: [max_conns]ConnSlot = [_]ConnSlot{.{}} ** max_conns,
+        const conn_chunk: usize = cfg.conn_chunk;
+        const chunked = conn_chunk > 0;
+        const chunk_count: usize = if (chunked) max_conns / conn_chunk else 0;
+        comptime {
+            if (chunked and max_conns % conn_chunk != 0) @compileError("max_conns must be a multiple of conn_chunk");
+        }
+        const Conns = if (chunked) [chunk_count]?*[conn_chunk]ConnSlot else [max_conns]ConnSlot;
+
+        /// The connection slots: all of them inline, or the chunks allocated
+        /// so far (cfg.conn_chunk). Reached through slotAt, never indexed.
+        conns: Conns = if (chunked) [_]?*[conn_chunk]ConnSlot{null} ** chunk_count else [_]ConnSlot{.{}} ** max_conns,
+        /// How many slots exist: max_conns inline, and a whole number of
+        /// chunks otherwise, allocated in order from the first.
+        slots_ready: usize = if (chunked) 0 else max_conns,
+        /// Where chunks come from. Null for an inline stack, and a chunked
+        /// one without it has no slots to give.
+        allocator: ?std.mem.Allocator = null,
         conn_hash: [hash_capacity]u16 = [_]u16{empty_slot} ** hash_capacity,
         active_count: usize = 0,
         // Listen state (up to 8 simultaneous listen ports)
@@ -246,6 +262,77 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .isn_gen = isn_mod.IsnGenerator.init(secret),
                 .syn_cookie = syn_cookie_mod.SynCookie.init(secret),
             };
+        }
+
+        /// A stack whose connection slots come from `allocator`, a chunk at a
+        /// time (cfg.conn_chunk). Written in place: an inline stack is
+        /// max_conns connections, which no thread's stack can hold as a
+        /// temporary, and this one is small enough that it does not matter.
+        pub fn initAlloc(self: *Self, link_ep: *LinkT, local_addr: [4]u8, secret: [16]u8, allocator: std.mem.Allocator) void {
+            self.* = .{
+                .link = link_ep,
+                .local_addr = local_addr,
+                .isn_gen = isn_mod.IsnGenerator.init(secret),
+                .syn_cookie = syn_cookie_mod.SynCookie.init(secret),
+                .allocator = allocator,
+            };
+        }
+
+        /// Give the chunks back. Nothing to do for an inline stack.
+        pub fn deinit(self: *Self) void {
+            if (comptime !chunked) return;
+            const a = self.allocator orelse return;
+            for (&self.conns) |*chunk| {
+                if (chunk.*) |c| a.destroy(c);
+                chunk.* = null;
+            }
+            self.slots_ready = 0;
+            self.active_count = 0;
+        }
+
+        fn SlotPtr(comptime P: type) type {
+            return if (@typeInfo(P).pointer.is_const) *const ConnSlot else *ConnSlot;
+        }
+
+        /// Slot `idx`, which has to exist (idx < slots_ready).
+        pub fn slotAt(self: anytype, idx: usize) SlotPtr(@TypeOf(self)) {
+            std.debug.assert(idx < self.slots_ready);
+            if (comptime chunked) return &self.conns[idx / conn_chunk].?[idx % conn_chunk];
+            return &self.conns[idx];
+        }
+
+        /// Slot `idx` if it holds a connection, and null for one that does
+        /// not or does not exist.
+        pub fn liveSlot(self: anytype, idx: usize) ?SlotPtr(@TypeOf(self)) {
+            if (idx >= self.slots_ready) return null;
+            const slot = self.slotAt(idx);
+            return if (slot.active) slot else null;
+        }
+
+        /// How many slots exist, for a caller walking them with slotAt.
+        pub fn slotCount(self: *const Self) usize {
+            return self.slots_ready;
+        }
+
+        /// One more chunk of slots, all free. False when the stack is at
+        /// max_conns, has no allocator, or the allocator said no.
+        fn growSlots(self: *Self) bool {
+            if (comptime !chunked) return false;
+            if (self.slots_ready >= max_conns) return false;
+            const a = self.allocator orelse return false;
+            const chunk = a.create([conn_chunk]ConnSlot) catch return false;
+            // Only what is read of a free slot: whatever takes one writes
+            // the rest, as it does when it takes back a slot that held a
+            // connection before. Not `.{}` per slot, which would build a
+            // whole connection on this thread's stack for each.
+            for (chunk) |*slot| {
+                slot.active = false;
+                slot.passive = false;
+                slot.is_v6 = false;
+            }
+            self.conns[self.slots_ready / conn_chunk] = chunk;
+            self.slots_ready += conn_chunk;
+            return true;
         }
 
         // ================================================================
@@ -348,7 +435,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             // Find existing connection
             if (self.findConn(id)) |idx| {
-                const slot = &self.conns[idx];
+                const slot = self.slotAt(idx);
 
                 // Parse TCP options from SYN or SYN-ACK during handshake
                 if (flags.syn and hdr_len > 20) {
@@ -460,7 +547,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             };
 
             if (self.findConn6(src6, dst6, tcp_hdr.srcPort(), tcp_hdr.dstPort())) |idx| {
-                const slot = &self.conns[idx];
+                const slot = self.slotAt(idx);
 
                 // Parse TCP options from SYN or SYN-ACK during handshake
                 if (flags.syn and hdr_len > 20) {
@@ -538,7 +625,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             const tcp_payload = if (payload.len > hdr_len) payload[hdr_len..] else &[_]u8{};
 
             if (self.findConn6(src6, dst6, tcp_hdr.srcPort(), tcp_hdr.dstPort())) |idx| {
-                const slot = &self.conns[idx];
+                const slot = self.slotAt(idx);
 
                 // Parse SYN options from reassembled packet
                 if (flags.syn and hdr_len > 20) {
@@ -618,7 +705,8 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             self.last_tick_ms = now_ms;
             self.reassembler.tick(now_ms);
             if (self.active_count == 0) return .none;
-            for (&self.conns, 0..) |*slot, idx| {
+            for (0..self.slots_ready) |idx| {
+                const slot = self.slotAt(idx);
                 if (!slot.active) continue;
 
                 const in_syn_queue = inSynQueue(slot);
@@ -659,41 +747,31 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         /// Write data to a connection. Returns bytes accepted.
         pub fn write(self: *Self, conn_idx: u16, data: []const u8) usize {
-            if (conn_idx >= max_conns) return 0;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return 0;
+            const slot = self.liveSlot(conn_idx) orelse return 0;
             return slot.conn.write(data);
         }
 
         /// Read data from a connection. Returns bytes read.
         pub fn read(self: *Self, conn_idx: u16, buf: []u8) usize {
-            if (conn_idx >= max_conns) return 0;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return 0;
+            const slot = self.liveSlot(conn_idx) orelse return 0;
             return slot.conn.read(buf);
         }
 
         /// Initiate close on a connection.
         pub fn close(self: *Self, conn_idx: u16) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.close();
         }
 
         /// Shutdown write direction (send FIN, continue receiving).
         pub fn shutdownWrite(self: *Self, conn_idx: u16) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.shutdownWrite();
         }
 
         /// Shutdown read direction (discard incoming data).
         pub fn shutdownRead(self: *Self, conn_idx: u16) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.shutdownRead();
         }
 
@@ -817,7 +895,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 // one to hand out. Releasing a slot takes it out of this
                 // queue, so this is the second line of defence rather than
                 // the first.
-                if (self.conns[idx].active) return idx;
+                if (self.slotAt(idx).active) return idx;
             }
             return null;
         }
@@ -852,7 +930,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .remote_port = remote_port,
             };
             const gen_isn = self.nextIsn(now_ms, id);
-            const slot = &self.conns[idx];
+            const slot = self.slotAt(idx);
             slot.* = ConnSlot{
                 .conn = ConnectionT.connect(local_port, remote_port, gen_isn),
                 .id = id,
@@ -873,7 +951,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .remote_port = remote_port,
             };
             const gen_isn = self.nextIsn(now_ms, id);
-            const slot = &self.conns[idx];
+            const slot = self.slotAt(idx);
             slot.* = ConnSlot{
                 .conn = ConnectionT.connect(local_port, remote_port, gen_isn),
                 .id = id,
@@ -889,49 +967,37 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         /// Get connection state.
         pub fn connState(self: *const Self, conn_idx: u16) ?tcp_connection.State {
-            if (conn_idx >= max_conns) return null;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return null;
+            const slot = self.liveSlot(conn_idx) orelse return null;
             return slot.conn.state;
         }
 
         /// Get connection ID.
         pub fn connId(self: *const Self, conn_idx: u16) ?ConnId {
-            if (conn_idx >= max_conns) return null;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return null;
+            const slot = self.liveSlot(conn_idx) orelse return null;
             return slot.id;
         }
 
         /// Set TCP_NODELAY (disable Nagle algorithm) on a connection.
         pub fn setNoDelay(self: *Self, conn_idx: u16, enabled: bool) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.sender.nagle_enabled = !enabled;
         }
 
         /// Get TCP_NODELAY state.
         pub fn getNoDelay(self: *const Self, conn_idx: u16) bool {
-            if (conn_idx >= max_conns) return false;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return false;
+            const slot = self.liveSlot(conn_idx) orelse return false;
             return !slot.conn.sender.nagle_enabled;
         }
 
         /// Enable/disable TCP keepalive on a connection.
         pub fn setKeepalive(self: *Self, conn_idx: u16, enabled: bool) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.keepalive_enabled = enabled;
         }
 
         /// Configure keepalive parameters.
         pub fn setKeepaliveParams(self: *Self, conn_idx: u16, idle_ms: u64, interval_ms: u64, max_probes: u8) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.keepalive_idle_ms = idle_ms;
             slot.conn.keepalive_interval_ms = interval_ms;
             slot.conn.keepalive_max_probes = max_probes;
@@ -945,24 +1011,21 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         /// Set SO_LINGER option on a connection.
         pub fn setLinger(self: *Self, conn_idx: u16, enabled: bool, timeout_ms: u64) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.setLinger(enabled, timeout_ms);
         }
 
         /// Enable/disable ECN on a connection.
         pub fn setEcn(self: *Self, conn_idx: u16, enabled: bool) void {
-            if (conn_idx >= max_conns) return;
-            const slot = &self.conns[conn_idx];
-            if (!slot.active) return;
+            const slot = self.liveSlot(conn_idx) orelse return;
             slot.conn.ecn_enabled = enabled;
         }
 
         /// Next poll deadline.
         pub fn nextPollAt(self: *const Self) ?u64 {
             var earliest: ?u64 = null;
-            for (&self.conns) |*slot| {
+            for (0..self.slots_ready) |idx| {
+                const slot = self.slotAt(idx);
                 if (!slot.active) continue;
                 if (slot.conn.nextPollAt()) |t| {
                     if (earliest == null or t < earliest.?) earliest = t;
@@ -1038,6 +1101,22 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             return true;
         }
 
+        /// udpSendFrom without an endpoint. A relay answers from the address
+        /// and port the sender wrote to, and needs nothing of an endpoint to
+        /// do it — not its port, not its receive buffer, which at 94KiB a
+        /// piece made a relay bind one per flow and hold sixteen flows at
+        /// once.
+        pub fn udpEmitFrom(
+            self: *Self,
+            src_addr: [4]u8,
+            src_port: u16,
+            dst_addr: [4]u8,
+            dst_port: u16,
+            data: []const u8,
+        ) void {
+            self.emitUdpPacket(src_addr, src_port, dst_addr, dst_port, data);
+        }
+
         /// Send a UDP datagram to an IPv6 destination.
         pub fn udpSendTo6(self: *Self, ep_idx: u16, dst_addr: [16]u8, dst_port: u16, data: []const u8) bool {
             if (ep_idx >= max_udp_endpoints) return false;
@@ -1085,7 +1164,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         // ================================================================
 
         fn emitSegment(self: *Self, conn_idx: u16, seg: Segment) void {
-            const slot = &self.conns[conn_idx];
+            const slot = self.slotAt(conn_idx);
             const id = slot.id;
             const now_ms = self.last_tick_ms;
 
@@ -1387,9 +1466,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             // Update the connection's MSS
             if (self.findConn(id)) |idx| {
                 const new_mss = next_hop_mtu -| 40; // IP(20) + TCP(20)
-                if (new_mss > 0 and new_mss < self.conns[idx].conn.mss) {
-                    self.conns[idx].conn.mss = new_mss;
-                    self.conns[idx].conn.sender.mss = new_mss;
+                if (new_mss > 0 and new_mss < self.slotAt(idx).conn.mss) {
+                    self.slotAt(idx).conn.mss = new_mss;
+                    self.slotAt(idx).conn.sender.mss = new_mss;
                 }
             }
         }
@@ -1415,9 +1494,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             // emb_src = our local, emb_dst = remote
             if (self.findConn6(emb_dst6, emb_src6, emb_dst_port, emb_src_port)) |idx| {
                 const new_mss: u16 = @intCast(mtu -| 60); // IPv6(40) + TCP(20)
-                if (new_mss > 0 and new_mss < self.conns[idx].conn.mss) {
-                    self.conns[idx].conn.mss = new_mss;
-                    self.conns[idx].conn.sender.mss = new_mss;
+                if (new_mss > 0 and new_mss < self.slotAt(idx).conn.mss) {
+                    self.slotAt(idx).conn.mss = new_mss;
+                    self.slotAt(idx).conn.sender.mss = new_mss;
                 }
             }
         }
@@ -1566,7 +1645,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             const idx = self.allocSlot() orelse return .none;
             const isn = self.nextIsn(now_ms, id);
 
-            const slot = &self.conns[idx];
+            const slot = self.slotAt(idx);
             slot.id = id;
             slot.active = true;
             slot.passive = true;
@@ -1806,7 +1885,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             const idx = self.allocSlot() orelse return .none;
             const our_isn = seg_ack -% 1;
 
-            const slot = &self.conns[idx];
+            const slot = self.slotAt(idx);
             slot.id = id;
             slot.active = true;
             slot.passive = true;
@@ -1881,7 +1960,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         fn releaseConn(self: *Self, idx: usize, in_syn_queue: bool) void {
             if (in_syn_queue) self.syn_queue_count -|= 1;
             self.hashRemove(idx);
-            self.conns[idx].active = false;
+            self.slotAt(idx).active = false;
             self.active_count -|= 1;
             // And out of the accept queue, if it was waiting there. The slot
             // goes back to whoever asks for one next, and an index left
@@ -1925,7 +2004,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     // over its reset this way — so the slot goes back now
                     // rather than being polled for an output that will never
                     // come.
-                    if (self.conns[idx].conn.state == .closed) {
+                    if (self.slotAt(idx).conn.state == .closed) {
                         self.releaseConn(idx, in_syn_queue);
                         return .{ .aborted = @intCast(idx) };
                     }
@@ -1937,15 +2016,15 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                     // set answers a different question, and unlisten during a
                     // handshake used to leave the half-open count and the slot
                     // itself behind, with no way to reach the connection.
-                    if (self.conns[idx].passive) {
+                    if (self.slotAt(idx).passive) {
                         self.syn_queue_count -|= 1;
                         // No listener left to hand it to, or nowhere to queue
                         // it: an established connection nobody can accept is a
                         // slot nobody frees, so end it here.
-                        if (!self.isListening(self.conns[idx].id.local_port) or !self.enqueueAccept(conn_idx)) {
-                            self.buildAndSend(self.conns[idx].id, .{ .rst = true, .ack = true }, self.conns[idx].conn.sender.snd_nxt, self.conns[idx].conn.receiver.rcv_nxt, 0, &.{});
+                        if (!self.isListening(self.slotAt(idx).id.local_port) or !self.enqueueAccept(conn_idx)) {
+                            self.buildAndSend(self.slotAt(idx).id, .{ .rst = true, .ack = true }, self.slotAt(idx).conn.sender.snd_nxt, self.slotAt(idx).conn.receiver.rcv_nxt, 0, &.{});
                             self.hashRemove(idx);
-                            self.conns[idx].active = false;
+                            self.slotAt(idx).active = false;
                             self.active_count -|= 1;
                             return .none;
                         }
@@ -1984,7 +2063,8 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         fn linearFind4(self: *Self, id: ConnId) ?usize {
-            for (self.conns[0..], 0..) |slot, idx| {
+            for (0..self.slots_ready) |idx| {
+                const slot = self.slotAt(idx);
                 if (slot.active and !slot.is_v6 and
                     std.mem.eql(u8, &slot.id.local_addr, &id.local_addr) and
                     slot.id.local_port == id.local_port and
@@ -1998,7 +2078,8 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         fn linearFind6(self: *Self, remote6: [16]u8, local6: [16]u8, remote_port: u16, local_port: u16) ?usize {
-            for (self.conns[0..], 0..) |slot, idx| {
+            for (0..self.slots_ready) |idx| {
+                const slot = self.slotAt(idx);
                 if (slot.active and slot.is_v6 and
                     slot.id.local_port == local_port and
                     slot.id.remote_port == remote_port and
@@ -2054,7 +2135,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             while (i < hash_capacity) : (i += 1) {
                 const slot_idx = self.conn_hash[pos];
                 if (slot_idx == empty_slot) return null;
-                const slot = &self.conns[slot_idx];
+                const slot = self.slotAt(slot_idx);
                 if (slot.active and !slot.is_v6 and
                     std.mem.eql(u8, &slot.id.local_addr, &id.local_addr) and
                     slot.id.local_port == id.local_port and
@@ -2076,7 +2157,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             while (i < hash_capacity) : (i += 1) {
                 const slot_idx = self.conn_hash[pos];
                 if (slot_idx == empty_slot) return null;
-                const slot = &self.conns[slot_idx];
+                const slot = self.slotAt(slot_idx);
                 if (slot.active and slot.is_v6 and
                     slot.id.local_port == local_port and
                     slot.id.remote_port == remote_port and
@@ -2092,7 +2173,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         fn hashInsert(self: *Self, slot_idx: usize) void {
             if (!use_hash_index) return;
-            const slot = &self.conns[slot_idx];
+            const slot = self.slotAt(slot_idx);
             const h = if (slot.is_v6)
                 connHash6(slot.remote_addr6, slot.local_addr6, slot.id.remote_port, slot.id.local_port)
             else
@@ -2110,7 +2191,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         fn hashRemove(self: *Self, slot_idx: usize) void {
             if (!use_hash_index) return;
-            const slot = &self.conns[slot_idx];
+            const slot = self.slotAt(slot_idx);
             const h = if (slot.is_v6)
                 connHash6(slot.remote_addr6, slot.local_addr6, slot.id.remote_port, slot.id.local_port)
             else
@@ -2134,11 +2215,14 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             }
         }
 
-        fn allocSlot(self: *const Self) ?usize {
-            for (self.conns[0..], 0..) |slot, idx| {
-                if (!slot.active) return idx;
+        /// A free slot, from a new chunk when every one there is taken.
+        fn allocSlot(self: *Self) ?usize {
+            for (0..self.slots_ready) |idx| {
+                if (!self.slotAt(idx).active) return idx;
             }
-            return null;
+            const first_new = self.slots_ready;
+            if (!self.growSlots()) return null;
+            return first_new;
         }
 
         fn nextIsn(self: *Self, now_ms: u64, id: ConnId) u32 {
@@ -4481,4 +4565,129 @@ test "FullStack: udpSendFrom carries the source the caller asked for" {
     try testing.expect(stack.udpSendTo(ep, peer, 40000, "mine"));
     const own = link_ep.readOutbound(&out_buf).?;
     try testing.expectEqualSlices(u8, &[_]u8{ 100, 64, 0, 1 }, own[12..16]);
+}
+
+test "FullStack: udpEmitFrom needs no endpoint, and builds what udpSendFrom builds" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 100, 64, 0, 1 });
+    const peer: [4]u8 = .{ 100, 64, 0, 9 };
+    const behind: [4]u8 = .{ 192, 168, 1, 5 };
+
+    // Far more answers than the stack has endpoints, and none bound.
+    for (0..64) |i| stack.udpEmitFrom(behind, 53, peer, @intCast(40000 + i), "answer");
+    try testing.expectEqual(@as(usize, 64), link_ep.outboundCount());
+    try testing.expectEqual(@as(usize, 0), stack.udp_count);
+
+    var emitted: [1500]u8 = undefined;
+    const raw = link_ep.readOutbound(&emitted).?;
+
+    // Byte for byte what the endpoint path sends for the same datagram,
+    // from the addresses on (the IP id before them counts up).
+    var drain: [1500]u8 = undefined;
+    while (link_ep.outboundCount() > 0) _ = link_ep.readOutbound(&drain);
+    const ep = stack.udpBind(0).?;
+    try testing.expect(stack.udpSendFrom(ep, behind, 53, peer, 40000, "answer"));
+    var sent: [1500]u8 = undefined;
+    const via_ep = link_ep.readOutbound(&sent).?;
+    try testing.expectEqualSlices(u8, via_ep[12..], raw[12..]);
+}
+
+// ================================================================
+// Connection slots in chunks (cfg.conn_chunk)
+// ================================================================
+
+const ChunkedStack = FullStackWith(48, .{ .conn_chunk = 16 });
+
+/// A client at 10.0.0.2:`port` opens a connection to 10.0.0.1:80 and
+/// finishes the handshake. Returns the connection's slot, once accepted.
+fn chunkedHandshake(stack: *ChunkedStack, link_ep: *link_mod.ChannelEndpoint, port: u16) !u16 {
+    var pkt: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt);
+    switch (stack.injectPacket(0, pkt[0..syn_len])) {
+        .accepted => {},
+        else => return error.SynNotAccepted,
+    }
+    var out: [1600]u8 = undefined;
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out) orelse return error.NoSynAck) orelse return error.NoSynAck;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 1001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt);
+    _ = stack.injectPacket(0, pkt[0..ack_len]);
+    return stack.accept() orelse error.NotAccepted;
+}
+
+test "FullStack chunked: slots come a chunk at a time, and only when a connection needs one" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: ChunkedStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{1} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 128);
+
+    // Nothing allocated until something connects.
+    try testing.expectEqual(@as(usize, 0), stack.slotCount());
+
+    var seen = [_]bool{false} ** 48;
+    for (0..16) |i| {
+        const idx = try chunkedHandshake(&stack, &link_ep, @intCast(5000 + i));
+        try testing.expect(!seen[idx]);
+        seen[idx] = true;
+    }
+    try testing.expectEqual(@as(usize, 16), stack.slotCount());
+
+    // The seventeenth takes a second chunk, and is a connection like any other.
+    const idx17 = try chunkedHandshake(&stack, &link_ep, 5016);
+    try testing.expectEqual(@as(usize, 32), stack.slotCount());
+    try testing.expect(idx17 >= 16);
+    try testing.expectEqual(tcp_connection.State.established, stack.connState(idx17).?);
+
+    // Data reaches it: found by its address, past the first chunk.
+    var pkt: [128]u8 = undefined;
+    const data_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 5016, .{ 10, 0, 0, 1 }, 80, 1001, stack.slotAt(idx17).conn.sender.snd_nxt, .{ .ack = true, .psh = true }, 65535, "hello", &pkt);
+    _ = stack.injectPacket(1, pkt[0..data_len]);
+    var got: [16]u8 = undefined;
+    try testing.expectEqualStrings("hello", got[0..stack.read(idx17, &got)]);
+}
+
+test "FullStack chunked: no more than max_conns, and a freed slot before a new chunk" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: ChunkedStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{2} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 128);
+
+    for (0..48) |i| _ = try chunkedHandshake(&stack, &link_ep, @intCast(6000 + i));
+    try testing.expectEqual(@as(usize, 48), stack.slotCount());
+
+    // Full: the forty-ninth SYN gets no slot and no answer.
+    var pkt: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 7000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt);
+    try testing.expectEqual(Event.none, stack.injectPacket(0, pkt[0..syn_len]));
+    try testing.expectEqual(@as(usize, 48), stack.slotCount());
+
+    // One goes away; the next connection takes its slot, and no chunk more.
+    const rst_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6020, .{ 10, 0, 0, 1 }, 80, 1001, 0, .{ .rst = true }, 0, &.{}, &pkt);
+    _ = stack.injectPacket(0, pkt[0..rst_len]);
+    while (link_ep.outboundCount() > 0) {
+        var out: [1600]u8 = undefined;
+        _ = link_ep.readOutbound(&out);
+    }
+    const reused = try chunkedHandshake(&stack, &link_ep, 7001);
+    try testing.expect(reused < 48);
+    try testing.expectEqual(@as(usize, 48), stack.slotCount());
+}
+
+test "FullStack chunked: an allocator that says no drops the SYN, and nothing else" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+    var stack: ChunkedStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{3} ** 16, failing.allocator());
+    defer stack.deinit();
+    _ = stack.listen(80, 128);
+
+    // The first chunk is had; the second is refused.
+    for (0..16) |i| _ = try chunkedHandshake(&stack, &link_ep, @intCast(8000 + i));
+    var pkt: [128]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 8016, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt);
+    try testing.expectEqual(Event.none, stack.injectPacket(0, pkt[0..syn_len]));
+    try testing.expectEqual(@as(usize, 16), stack.slotCount());
+    // What it had still works.
+    try testing.expectEqual(tcp_connection.State.established, stack.connState(0).?);
 }
