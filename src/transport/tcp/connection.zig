@@ -383,7 +383,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                             return .{ .send = .{
                                 .flags = .{ .syn = true },
                                 .seq = s.seq,
-                                .window = self.scaledWindow(),
+                                .window = self.synWindow(),
                                 .include_syn_options = true,
                             } };
                         },
@@ -475,6 +475,13 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
         /// Get the next time poll() should be called.
         pub fn nextPollAt(self: *const Self) ?u64 {
+            // An acknowledgement owed leaves on the next poll, so the next
+            // poll is due now. Only where poll sends it: elsewhere the flag
+            // would say "now" for as long as the connection lasted.
+            if (self.receiver.ack_needed) switch (self.state) {
+                .established, .close_wait, .fin_wait_1, .fin_wait_2, .closing, .last_ack => return 0,
+                else => {},
+            };
             return self.sender.nextPollAt();
         }
 
@@ -582,7 +589,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .flags = .{ .syn = true, .ack = true },
                 .seq = self.sender.iss,
                 .ack = self.receiver.rcv_nxt,
-                .window = self.scaledWindow(),
+                .window = self.synWindow(),
                 .include_syn_options = true,
             } };
         }
@@ -627,7 +634,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     .flags = .{ .syn = true, .ack = true },
                     .seq = self.sender.iss,
                     .ack = self.receiver.rcv_nxt,
-                    .window = self.scaledWindow(),
+                    .window = self.synWindow(),
                     .include_syn_options = true,
                 } };
             }
@@ -689,6 +696,8 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             // Process data (discard if read direction is shut down)
             if (payload.len > 0 and !self.read_shutdown) {
                 _ = self.receiver.onSegment(seg_seq, payload);
+            } else if (payload.len == 0 and !flags.fin) {
+                self.receiver.onEmptySegment(seg_seq);
             }
 
             // Process FIN
@@ -774,7 +783,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     return .{ .send = .{
                         .flags = .{ .syn = true },
                         .seq = s.seq,
-                        .window = self.scaledWindow(),
+                        .window = self.synWindow(),
                         .include_syn_options = true,
                     } };
                 },
@@ -924,6 +933,14 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         fn applyRecvWscale(self: *const Self, seg_wnd: u16) u32 {
             if (!self.wscale_enabled) return @as(u32, seg_wnd);
             return @as(u32, seg_wnd) << self.snd_wscale;
+        }
+
+        /// The window a SYN or SYN+ACK carries. Never scaled (RFC 7323
+        /// 2.2): the scale is only agreed by these two segments, so the
+        /// field in them is read as it is. Shifting it here advertised a
+        /// 64KiB window as 512 bytes for the first round trip.
+        fn synWindow(self: *const Self) u16 {
+            return @intCast(@min(self.receiver.windowRaw(), 65535));
         }
 
         /// Get our advertised window, scaled down for the wire (16-bit TCP header field).
@@ -1997,4 +2014,41 @@ test "Connection: with timestamps on, a segment's data leaves room for them" {
     try testing.expectEqual(@as(u16, 1228), ts.sender.mss);
     const no_ts = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1460 });
     try testing.expectEqual(@as(u16, 1240), no_ts.sender.mss);
+}
+
+test "Connection: an ACK owed makes the next poll due now, and the poll pays it" {
+    var conn = makeEstablished();
+    try testing.expect(conn.nextPollAt() != @as(?u64, 0));
+
+    // A zero-window probe, from just behind what has been received.
+    _ = conn.onSegment(10, .{ .ack = true }, conn.receiver.rcv_nxt -% 1, 1001, 65535, &.{});
+    try testing.expectEqual(@as(?u64, 0), conn.nextPollAt());
+
+    switch (conn.poll(10)) {
+        .send => |seg| {
+            try testing.expect(seg.flags.ack);
+            try testing.expectEqual(conn.receiver.rcv_nxt, seg.ack);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expect(conn.nextPollAt() != @as(?u64, 0));
+}
+
+test "Connection: a SYN+ACK carries its window unscaled, though scaling was agreed" {
+    var conn = Connection.acceptFromSyn(80, 5000, 0, .{
+        .mss = 1460,
+        .window_scale = 7,
+        .window_scale_offered = true,
+        .sack_permitted = true,
+        .timestamps_enabled = false,
+    });
+    try testing.expect(conn.wscale_enabled);
+    try testing.expect(conn.rcv_wscale > 0);
+    switch (conn.onSegment(0, .{ .syn = true }, 1000, 0, 65535, &.{})) {
+        .send => |seg| {
+            try testing.expect(seg.flags.syn and seg.flags.ack);
+            try testing.expectEqual(@as(u16, @intCast(@min(conn.receiver.windowRaw(), 65535))), seg.window);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
