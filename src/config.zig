@@ -32,6 +32,13 @@ pub const Config = struct {
     /// Default MSS (Maximum Segment Size).
     default_mss: u16 = 1460,
 
+    /// The largest IPv4 packet the link carries, header included. A UDP
+    /// datagram the stack sends that is larger goes out in fragments of
+    /// at most this, rather than not at all. A tunnel's link is smaller
+    /// than an Ethernet's: 1280 for one whose packets are themselves
+    /// carried over a 1500-byte path.
+    link_mtu: u16 = 1500,
+
     /// Enable Nagle algorithm by default.
     nagle_enabled: bool = true,
 

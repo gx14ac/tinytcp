@@ -93,6 +93,9 @@ pub fn FullStackWith(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
 /// Full integrated stack parameterized by Config and link endpoint type.
 pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Config, comptime LinkT: type) type {
+    // A packet is built in a 1500-byte buffer, and an IPv4 link carries
+    // at least 68 (RFC 791).
+    comptime std.debug.assert(cfg.link_mtu >= 68 and cfg.link_mtu <= 1500);
     const ConnectionT = tcp_connection.ConnectionWith(cfg);
     const SenderT = tcp_sender.SenderWith(cfg);
     const ReceiverT = tcp_receiver.ReceiverWith(cfg);
@@ -1555,8 +1558,14 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         fn emitUdpPacket(self: *Self, src_addr: [4]u8, src_port: u16, dst_addr: [4]u8, dst_port: u16, data: []const u8) void {
+            if (udp_header.header_len + data.len > max_udp_len) return;
             const udp_len: u16 = @intCast(udp_header.header_len + data.len);
             const total_len: u16 = 20 + udp_len;
+
+            if (total_len > cfg.link_mtu) {
+                self.emitUdpFragments(src_addr, src_port, dst_addr, dst_port, data);
+                return;
+            }
 
             var buf: [1500]u8 = undefined;
             if (total_len > buf.len) return;
@@ -1598,6 +1607,79 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             // Send via link endpoint
             var pb = @import("packet_buf.zig").PacketBuf.initWithData(buf[0..], 0, total_len);
             _ = self.link.extract(&pb);
+        }
+
+        /// The largest UDP datagram an IPv4 packet can carry.
+        const max_udp_len: usize = 65535 - 20;
+
+        /// A UDP datagram larger than the link takes, sent as IPv4 fragments
+        /// of at most `cfg.link_mtu` (RFC 791), which the receiver puts back
+        /// together. Built a fragment at a time, never whole: the datagram
+        /// can be 64KiB, and the stack sends from whatever thread polls it.
+        ///
+        /// Never Don't Fragment: these are the stack's own packets — a relay's
+        /// answer, typically — and splitting them here is what keeps a
+        /// large answer (a DNS response with EDNS, a QUIC handshake) from
+        /// being lost on a link smaller than the path it came over.
+        fn emitUdpFragments(self: *Self, src_addr: [4]u8, src_port: u16, dst_addr: [4]u8, dst_port: u16, data: []const u8) void {
+            const cksum_mod = @import("checksum.zig");
+            const udp_len: u16 = @intCast(udp_header.header_len + data.len);
+
+            // The UDP header, its checksum over the whole datagram.
+            var udp_hdr: [udp_header.header_len]u8 = undefined;
+            std.mem.writeInt(u16, udp_hdr[0..2], src_port, .big);
+            std.mem.writeInt(u16, udp_hdr[2..4], dst_port, .big);
+            std.mem.writeInt(u16, udp_hdr[4..6], udp_len, .big);
+            udp_hdr[6] = 0;
+            udp_hdr[7] = 0;
+            const ph = cksum_mod.pseudoHeaderIpv4(src_addr, dst_addr, 17, udp_len);
+            const raw = cksum_mod.finish(cksum_mod.accumulate(cksum_mod.accumulate(ph, &udp_hdr), data));
+            std.mem.writeInt(u16, udp_hdr[6..8], if (raw == 0) 0xFFFF else raw, .big);
+
+            // Every fragment but the last carries a multiple of 8 bytes.
+            const per_fragment: usize = (@as(usize, cfg.link_mtu) - 20) & ~@as(usize, 7);
+            const id = self.ip_id_counter;
+            self.ip_id_counter +%= 1;
+
+            var buf: [1500]u8 = undefined;
+            var offset: usize = 0; // into the UDP datagram: header, then data
+            while (offset < udp_len) {
+                const chunk = @min(per_fragment, udp_len - offset);
+                const more = offset + chunk < udp_len;
+
+                var ip_hdr = ipv4_header.MutableHeader.init(&buf) catch return;
+                ip_hdr.setTotalLen(@intCast(20 + chunk));
+                ip_hdr.setIdentification(id);
+                ip_hdr.setTtl(64);
+                ip_hdr.setProtocol(.udp);
+                ip_hdr.setSrcAddr(src_addr);
+                ip_hdr.setDstAddr(dst_addr);
+                const flags_offset: u16 = (if (more) @as(u16, 0x2000) else 0) | @as(u16, @intCast(offset / 8));
+                std.mem.writeInt(u16, buf[6..8], flags_offset, .big);
+                ip_hdr.computeChecksum();
+
+                // This fragment's bytes of the datagram: what is left of
+                // the header, then data.
+                var at: usize = 20;
+                var pos = offset;
+                const end = offset + chunk;
+                if (pos < udp_header.header_len) {
+                    const n = @min(udp_header.header_len, end) - pos;
+                    @memcpy(buf[at .. at + n], udp_hdr[pos .. pos + n]);
+                    at += n;
+                    pos += n;
+                }
+                if (pos < end) {
+                    const from = pos - udp_header.header_len;
+                    const n = end - pos;
+                    @memcpy(buf[at .. at + n], data[from .. from + n]);
+                    at += n;
+                }
+
+                var pb = @import("packet_buf.zig").PacketBuf.initWithData(buf[0..], 0, at);
+                _ = self.link.extract(&pb);
+                offset = end;
+            }
         }
 
         fn emitUdpPacket6(self: *Self, src_port: u16, dst_addr: [16]u8, dst_port: u16, data: []const u8) void {
@@ -4790,4 +4872,104 @@ test "FullStack chunked: one connection near the end keeps its chunk, and an old
     try testing.expectEqual(@as(usize, 0), stack.read(old, &buf));
     try testing.expectEqual(@as(usize, 0), stack.write(old, "late"));
     stack.close(old);
+}
+
+// ================================================================
+// UDP larger than the link: IPv4 fragments (cfg.link_mtu)
+// ================================================================
+
+const TunnelStack = FullStackWith(16, .{ .link_mtu = 1280 });
+
+/// Read every packet the stack queued and put the UDP datagram back
+/// together, checking each fragment on the way. Returns the datagram (UDP
+/// header and data) and how many fragments carried it.
+fn reassembleUdp(link_ep: *link_mod.ChannelEndpoint, out: []u8, mtu: usize) !struct { len: usize, fragments: usize } {
+    var len: usize = 0;
+    var fragments: usize = 0;
+    var id: ?u16 = null;
+    // The one fragment without More Fragments, and where it ends.
+    var lasts: usize = 0;
+    var last_end: usize = 0;
+    var pkt_buf: [1600]u8 = undefined;
+    while (link_ep.readOutbound(&pkt_buf)) |pkt| {
+        fragments += 1;
+        try testing.expect(pkt.len <= mtu);
+        const hdr = try ipv4_header.Header.parse(pkt);
+        try testing.expect(hdr.isChecksumValid());
+        try testing.expect(!hdr.dontFragment());
+        if (id) |i| try testing.expectEqual(i, hdr.identification()) else id = hdr.identification();
+        const off = @as(usize, hdr.fragmentOffset()) * 8;
+        const body = pkt[20..hdr.totalLen()];
+        if (hdr.moreFragments()) {
+            try testing.expectEqual(@as(usize, 0), body.len % 8);
+        } else {
+            lasts += 1;
+            last_end = off + body.len;
+        }
+        @memcpy(out[off .. off + body.len], body);
+        len = @max(len, off + body.len);
+    }
+    // Exactly one says it is the last, and it is: nothing ends after it.
+    try testing.expectEqual(@as(usize, 1), lasts);
+    try testing.expectEqual(len, last_end);
+    return .{ .len = len, .fragments = fragments };
+}
+
+test "FullStack: UDP larger than the link goes in fragments, which put back together are the datagram" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 100, 64, 0, 1 });
+    const peer: [4]u8 = .{ 100, 64, 0, 9 };
+    const behind: [4]u8 = .{ 8, 8, 8, 8 };
+    var data: [3000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7 + 3);
+
+    // An answer the size of a large DNS response or a QUIC handshake.
+    stack.udpEmitFrom(behind, 53, peer, 40000, &data);
+
+    var datagram: [4000]u8 = undefined;
+    const got = try reassembleUdp(&link_ep, &datagram, 1280);
+    // 8 + 3000 bytes in pieces of 1256 (1280 - 20, a multiple of 8).
+    try testing.expectEqual(@as(usize, 3), got.fragments);
+    try testing.expectEqual(@as(usize, 8 + data.len), got.len);
+    try testing.expectEqualSlices(u8, &data, datagram[8..got.len]);
+    try testing.expectEqual(@as(u16, 53), std.mem.readInt(u16, datagram[0..2], .big));
+    try testing.expectEqual(@as(u16, 40000), std.mem.readInt(u16, datagram[2..4], .big));
+    try testing.expectEqual(@as(u16, 8 + data.len), std.mem.readInt(u16, datagram[4..6], .big));
+    // The checksum covers the whole datagram, as if it had gone whole.
+    const cksum = @import("checksum.zig");
+    const ph = cksum.pseudoHeaderIpv4(behind, peer, 17, @intCast(got.len));
+    try testing.expectEqual(@as(u16, 0), cksum.finish(cksum.accumulate(ph, datagram[0..got.len])));
+}
+
+test "FullStack: UDP that fits the link goes whole, and one byte more does not" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 100, 64, 0, 1 });
+    var data: [1280 - 28 + 1]u8 = undefined;
+    @memset(&data, 0x5a);
+
+    stack.udpEmitFrom(.{ 8, 8, 8, 8 }, 53, .{ 100, 64, 0, 9 }, 40000, data[0 .. data.len - 1]);
+    try testing.expectEqual(@as(usize, 1), link_ep.outboundCount());
+    var pkt: [1600]u8 = undefined;
+    const whole = link_ep.readOutbound(&pkt).?;
+    try testing.expectEqual(@as(usize, 1280), whole.len);
+    try testing.expect(!(try ipv4_header.Header.parse(whole)).moreFragments());
+
+    stack.udpEmitFrom(.{ 8, 8, 8, 8 }, 53, .{ 100, 64, 0, 9 }, 40000, &data);
+    var datagram: [1600]u8 = undefined;
+    const got = try reassembleUdp(&link_ep, &datagram, 1280);
+    try testing.expectEqual(@as(usize, 2), got.fragments);
+    try testing.expectEqual(@as(usize, 8 + data.len), got.len);
+}
+
+test "FullStack: on an Ethernet-sized link, what used to be dropped now goes in fragments" {
+    // The default link takes 1500. A datagram past it was not sent at all.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 100, 64, 0, 1 });
+    var data: [2000]u8 = undefined;
+    @memset(&data, 1);
+    stack.udpEmitFrom(.{ 8, 8, 8, 8 }, 53, .{ 100, 64, 0, 9 }, 40000, &data);
+    var datagram: [2100]u8 = undefined;
+    const got = try reassembleUdp(&link_ep, &datagram, 1500);
+    try testing.expectEqual(@as(usize, 2), got.fragments);
+    try testing.expectEqual(@as(usize, 2008), got.len);
 }

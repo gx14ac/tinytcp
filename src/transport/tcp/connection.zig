@@ -776,8 +776,13 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         pub fn applyPeerOptions(self: *Self, opts: options_mod.NegotiatedOptions) void {
             // MSS
             if (opts.mss > 0) {
-                self.mss = opts.mss;
-                self.sender.setMss(opts.mss);
+                // No larger than this side's own: the peer's MSS is what it
+                // can take, and cfg.default_mss what this side's link can
+                // carry. A segment the size of the larger would not fit
+                // the smaller link (RFC 1122 4.2.2.6).
+                const mss = @min(opts.mss, cfg.default_mss);
+                self.mss = mss;
+                self.sender.setMss(mss);
             }
 
             // Window Scale: enable if peer included WScale option in SYN (even with shift=0)
@@ -1912,4 +1917,14 @@ test "Connection: a connection still opening can be reset" {
         else => return error.TestUnexpectedResult,
     }
     try testing.expectEqual(State.closed, conn.state);
+}
+
+test "Connection: the MSS sent with is the smaller of the peer's and this side's own" {
+    const Small = ConnectionWith(.{ .default_mss = 1240 });
+    const big_peer = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1460 });
+    try testing.expectEqual(@as(u16, 1240), big_peer.mss);
+    try testing.expectEqual(@as(u16, 1240), big_peer.sender.mss);
+    const small_peer = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1000 });
+    try testing.expectEqual(@as(u16, 1000), small_peer.mss);
+    try testing.expectEqual(@as(u16, 1000), small_peer.sender.mss);
 }
