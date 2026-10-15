@@ -14,6 +14,16 @@ pub const Config = struct {
     /// TCP receive buffer size per connection (bytes).
     recv_buf_size: usize = 65536,
 
+    /// Keep each connection's send and receive bytes in memory from the
+    /// stack's allocator, grown to what the connection holds and given
+    /// back once it is drained, rather than in arrays of the sizes above
+    /// inside every connection. The sizes above become the most a
+    /// connection may hold. Needs a stack built with initAlloc.
+    grow_buffers: bool = false,
+
+    /// What a grown buffer goes back to once drained.
+    buf_initial: usize = 4096,
+
     /// Maximum out-of-order segments tracked per connection.
     max_ooo_segments: usize = 32,
 

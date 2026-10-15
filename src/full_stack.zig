@@ -253,6 +253,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         pub fn init(link_ep: *LinkT, local_addr: [4]u8) Self {
             if (comptime chunked) @compileError("a stack with conn_chunk set takes its slots from an allocator: initAlloc");
+            if (comptime cfg.grow_buffers) @compileError("a stack with grow_buffers set takes its buffers from an allocator: initAlloc");
             return Self{
                 .link = link_ep,
                 .local_addr = local_addr,
@@ -261,6 +262,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         pub fn initWithSecret(link_ep: *LinkT, local_addr: [4]u8, secret: [16]u8) Self {
             if (comptime chunked) @compileError("a stack with conn_chunk set takes its slots from an allocator: initAlloc");
+            if (comptime cfg.grow_buffers) @compileError("a stack with grow_buffers set takes its buffers from an allocator: initAlloc");
             return Self{
                 .link = link_ep,
                 .local_addr = local_addr,
@@ -283,8 +285,15 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             };
         }
 
-        /// Give the chunks back. Nothing to do for an inline stack.
+        /// Give the chunks back, and what open connections hold. Nothing
+        /// to do for an inline stack with fixed buffers.
         pub fn deinit(self: *Self) void {
+            if (comptime cfg.grow_buffers) {
+                for (0..self.slots_ready) |i| {
+                    const slot = self.slotAt(i);
+                    if (slot.active) slot.conn.releaseBuffers();
+                }
+            }
             if (comptime !chunked) return;
             const a = self.allocator orelse return;
             for (&self.conns) |*chunk| {
@@ -293,6 +302,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             }
             self.slots_ready = 0;
             self.active_count = 0;
+        }
+
+        /// Hand a connection just made in `slot` the stack's allocator, for
+        /// its buffers to grow from.
+        fn adoptBuffers(self: *Self, slot: *ConnSlot) void {
+            if (comptime !cfg.grow_buffers) return;
+            if (self.allocator) |a| slot.conn.setAllocator(a);
         }
 
         fn SlotPtr(comptime P: type) type {
@@ -970,6 +986,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .id = id,
                 .active = true,
             };
+            self.adoptBuffers(slot);
             self.active_count += 1;
             self.hashInsert(idx);
             return @intCast(idx);
@@ -994,6 +1011,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .local_addr6 = self.local_addr6,
                 .remote_addr6 = remote_addr,
             };
+            self.adoptBuffers(slot);
             self.active_count += 1;
             self.hashInsert(idx);
             return @intCast(idx);
@@ -1204,7 +1222,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             // Get payload from send buffer
             const payload_data = if (seg.payload_len > 0)
-                slot.conn.send_buf[seg.payload_offset .. seg.payload_offset + seg.payload_len]
+                slot.conn.sendBytes()[seg.payload_offset .. seg.payload_offset + seg.payload_len]
             else
                 &[_]u8{};
 
@@ -1770,6 +1788,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             slot.local_addr6 = if (v6) |a| a.local else .{0} ** 16;
             slot.remote_addr6 = if (v6) |a| a.remote else .{0} ** 16;
             slot.conn = ConnectionT.acceptFromSyn(id.local_port, isn, now_ms, peer_opts);
+            self.adoptBuffers(slot);
 
             // Process the SYN — produces SYN+ACK output
             const output = slot.conn.onSegment(now_ms, .{ .syn = true }, peer_seq, 0, peer_wnd, &.{});
@@ -2018,10 +2037,11 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .local_port = id.local_port,
                 .remote_port = id.remote_port,
                 .sender = SenderT.init(our_isn, mss),
-                .receiver = ReceiverT.init(seg_seq -% 1, @intCast(@min(cfg.recv_buf_size, 65535))),
+                .receiver = ReceiverT.init(seg_seq -% 1, ConnectionT.initial_rcv_wnd),
                 .mss = mss,
                 .last_activity_ms = now_ms,
             };
+            self.adoptBuffers(slot);
             slot.conn.sender.syn_sent = true;
             slot.conn.sender.syn_acked = true;
             slot.conn.sender.snd_nxt = our_isn +% 1;
@@ -2043,7 +2063,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
         fn emitSegmentForSlot(self: *Self, slot: *ConnSlot, seg: Segment) void {
             const payload_data = if (seg.payload_len > 0)
-                slot.conn.send_buf[seg.payload_offset .. seg.payload_offset + seg.payload_len]
+                slot.conn.sendBytes()[seg.payload_offset .. seg.payload_offset + seg.payload_len]
             else
                 &[_]u8{};
 
@@ -2078,6 +2098,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         fn releaseConn(self: *Self, idx: usize, in_syn_queue: bool) void {
             if (in_syn_queue) self.syn_queue_count -|= 1;
             self.hashRemove(idx);
+            self.slotAt(idx).conn.releaseBuffers();
             self.slotAt(idx).active = false;
             self.active_count -|= 1;
             // And out of the accept queue, if it was waiting there. The slot
@@ -2142,6 +2163,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                         if (!self.isListening(self.slotAt(idx).id.local_port) or !self.enqueueAccept(conn_idx)) {
                             self.buildAndSend(self.slotAt(idx).id, .{ .rst = true, .ack = true }, self.slotAt(idx).conn.sender.snd_nxt, self.slotAt(idx).conn.receiver.rcv_nxt, 0, &.{});
                             self.hashRemove(idx);
+                            self.slotAt(idx).conn.releaseBuffers();
                             self.slotAt(idx).active = false;
                             self.active_count -|= 1;
                             return .none;
@@ -4335,7 +4357,7 @@ test "FullStackWith: embedded_minimal config completes TCP handshake + data" {
     try testing.expectEqualSlices(u8, "hello", read_buf[0..n]);
 
     // Verify config was applied: send buffer is small
-    try testing.expectEqual(@as(usize, 1024), stack.conns[0].conn.send_buf.len);
+    try testing.expectEqual(@as(usize, 1024), stack.conns[0].conn.send.slice().len);
     // Verify recv buffer is small
     try testing.expectEqual(@as(usize, 2048), stack.conns[0].conn.receiver.buf_cap);
     // Verify retx queue is small
@@ -5017,3 +5039,110 @@ test "FullStack: a connection a cookie accepted sends no segment past this side'
 }
 
 const TunnelSmallMss = FullStackWith(16, .{ .link_mtu = 1280, .default_mss = 1240 });
+
+const GrowStack = FullStackWith(16, .{ .grow_buffers = true, .send_buf_size = 256 * 1024, .buf_initial = 4096 });
+
+/// A connection to `stack` on port 80 from 10.0.0.2:`port`, through the
+/// whole handshake.
+fn growAccept(stack: *GrowStack, link_ep: *link_mod.ChannelEndpoint, port: u16) !u16 {
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(10, pkt_buf[0..syn]);
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 3001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    return switch (stack.injectPacket(20, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => error.TestUnexpectedResult,
+    };
+}
+
+test "FullStack grow_buffers: a connection takes more than it starts with, and gives it back drained" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: GrowStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{6} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 16);
+    const idx = try growAccept(&stack, &link_ep, 6000);
+
+    // Far past 64KiB, which is all a fixed buffer of the default size took.
+    var big: [100_000]u8 = undefined;
+    @memset(&big, 'x');
+    try testing.expectEqual(@as(usize, big.len), stack.write(idx, &big));
+    try testing.expect(stack.conns[idx].conn.send.heap.len >= big.len);
+
+    // The peer acknowledges everything as it comes, until nothing is left.
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    var now: u64 = 30;
+    var acked: usize = 0;
+    while (now < 60_000 and acked < big.len) : (now += 10) {
+        _ = stack.poll(now);
+        while (link_ep.readOutbound(&out_buf)) |raw| {
+            const seg = parseTcpFromRaw(raw).?;
+            if (seg.payload_len == 0) continue;
+            const end = seg.seq +% @as(u32, @intCast(seg.payload_len));
+            const len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, end, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+            _ = stack.injectPacket(now, pkt_buf[0..len]);
+            acked += seg.payload_len;
+        }
+    }
+    try testing.expectEqual(big.len, acked);
+    try testing.expectEqual(@as(usize, 4096), stack.conns[idx].conn.send.heap.len);
+
+    // The other way: more than the first 4KiB arrives, is read, and the
+    // receive side goes back to its first size too.
+    var seq: u32 = 3001;
+    var chunk: [1400]u8 = undefined;
+    @memset(&chunk, 'y');
+    var data_buf: [1600]u8 = undefined;
+    const snd_nxt = stack.conns[idx].conn.sender.snd_nxt;
+    for (0..5) |_| {
+        const len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, seq, snd_nxt, .{ .ack = true, .psh = true }, 65535, &chunk, &data_buf);
+        _ = stack.injectPacket(now, data_buf[0..len]);
+        seq +%= chunk.len;
+    }
+    try testing.expect(stack.conns[idx].conn.receiver.store.heap.len >= 5 * chunk.len);
+    var read_buf: [8000]u8 = undefined;
+    try testing.expectEqual(@as(usize, 5 * chunk.len), stack.read(idx, &read_buf));
+    try testing.expectEqual(@as(usize, 4096), stack.conns[idx].conn.receiver.store.heap.len);
+}
+
+test "FullStack grow_buffers: a connection reset while it holds data gives its memory back" {
+    // testing.allocator fails the test on a leak: a slot the reset frees
+    // has to hand back what it held, before the next connection there
+    // writes over it.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: GrowStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{7} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 16);
+
+    for (0..3) |round| {
+        const port: u16 = 6000 + @as(u16, @intCast(round));
+        const idx = try growAccept(&stack, &link_ep, port);
+        var big: [20_000]u8 = undefined;
+        @memset(&big, 'z');
+        try testing.expectEqual(@as(usize, big.len), stack.write(idx, &big));
+        var pkt_buf: [128]u8 = undefined;
+        const rst = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 3001, 0, .{ .rst = true }, 0, &.{}, &pkt_buf);
+        _ = stack.injectPacket(40, pkt_buf[0..rst]);
+        try testing.expect(!stack.conns[idx].active);
+        var out_buf: [1600]u8 = undefined;
+        while (link_ep.readOutbound(&out_buf)) |_| {}
+    }
+}
+
+test "FullStack grow_buffers: connections open at the end are given back with the stack" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: GrowStack = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{8} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 16);
+    const idx = try growAccept(&stack, &link_ep, 6100);
+    var big: [20_000]u8 = undefined;
+    @memset(&big, 'w');
+    try testing.expectEqual(@as(usize, big.len), stack.write(idx, &big));
+    var out_buf: [1600]u8 = undefined;
+    while (link_ep.readOutbound(&out_buf)) |_| {}
+}

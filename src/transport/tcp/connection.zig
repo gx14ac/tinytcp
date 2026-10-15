@@ -21,6 +21,7 @@ const options_mod = @import("options.zig");
 const congestion_mod = @import("congestion.zig");
 const rtt_mod = @import("rtt.zig");
 const config_mod = @import("../../config.zig");
+const byte_store = @import("byte_store.zig");
 pub const Config = config_mod.Config;
 
 const seqLt = endpoint_mod.seqLt;
@@ -80,6 +81,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
     const SenderT = sender_mod.SenderWith(cfg);
     const ReceiverT = receiver_mod.ReceiverWith(cfg);
     const conn_send_buf_size = cfg.send_buf_size;
+    const SendStore = byte_store.ByteStore(conn_send_buf_size, cfg.grow_buffers, cfg.buf_initial);
 
     return struct {
         const Self = @This();
@@ -94,8 +96,9 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         sender: SenderT = .{},
         receiver: ReceiverT = .{},
 
-        // Send buffer (application data waiting to be sent)
-        send_buf: [conn_send_buf_size]u8 = undefined,
+        // Send buffer (application data waiting to be sent): from snd_una
+        // on, the bytes in flight and then those not yet sent.
+        send: SendStore = .{},
         send_buf_len: usize = 0,
         /// Bytes already passed to sender (but maybe not yet acked).
         send_buf_sent: usize = 0,
@@ -178,9 +181,13 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// Write data to the send buffer. Returns number of bytes accepted.
         pub fn write(self: *Self, data: []const u8) usize {
             if (self.state != .established and self.state != .close_wait) return 0;
-            const space = self.send_buf.len - self.send_buf_len;
+            // Room for all of it, if the buffer may grow that far; what it
+            // cannot take is the caller's to offer again.
+            _ = self.send.ensure(@min(self.send_buf_len + data.len, conn_send_buf_size), self.send_buf_len);
+            const buf = self.send.slice();
+            const space = buf.len - self.send_buf_len;
             const copy_len = @min(data.len, space);
-            @memcpy(self.send_buf[self.send_buf_len .. self.send_buf_len + copy_len], data[0..copy_len]);
+            @memcpy(buf[self.send_buf_len .. self.send_buf_len + copy_len], data[0..copy_len]);
             self.send_buf_len += copy_len;
             return copy_len;
         }
@@ -500,7 +507,8 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 self.send_buf_sent = 0;
             } else {
                 // Shift buffer
-                std.mem.copyForwards(u8, self.send_buf[0 .. self.send_buf_len - acked_bytes], self.send_buf[acked_bytes..self.send_buf_len]);
+                const buf = self.send.slice();
+                std.mem.copyForwards(u8, buf[0 .. self.send_buf_len - acked_bytes], buf[acked_bytes..self.send_buf_len]);
                 self.send_buf_len -= acked_bytes;
                 if (self.send_buf_sent >= acked_bytes) {
                     self.send_buf_sent -= acked_bytes;
@@ -511,6 +519,44 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             // Whatever is left in flight starts that much earlier in the
             // buffer now, and a retransmission reads it by offset.
             self.sender.shiftBufOffsets(acked_bytes);
+            // Drained, or nearly: back to the small buffer.
+            self.send.shrink(self.send_buf_len);
+        }
+
+        /// The bytes from snd_una on: in flight, then not yet sent. What a
+        /// segment's payload_offset and payload_len index.
+        pub fn sendBytes(self: *Self) []u8 {
+            return self.send.slice();
+        }
+
+        /// Where this connection's buffers come from, when they grow
+        /// (Config.grow_buffers). Set by the stack when it makes the
+        /// connection.
+        pub fn setAllocator(self: *Self, a: std.mem.Allocator) void {
+            self.send.allocator = a;
+            self.receiver.setAllocator(a);
+        }
+
+        /// The receive window a connection opens with. 65535 where the
+        /// buffer is no larger, as before; the buffer's size where it is,
+        /// so that what is advertised past 64KiB is also accepted.
+        pub const initial_rcv_wnd: u32 = if (cfg.recv_buf_size <= 65536) 65535 else @intCast(cfg.recv_buf_size);
+
+        /// Start the receiver over at the peer's ISN, as the handshake does
+        /// — keeping where its buffer comes from, and giving back what it
+        /// held (nothing, before a handshake).
+        fn resetReceiver(self: *Self, irs: u32) void {
+            const a = self.receiver.store.allocator;
+            self.receiver.releaseBuffer();
+            self.receiver = ReceiverT.init(irs, initial_rcv_wnd);
+            self.receiver.store.allocator = a;
+        }
+
+        /// Give back what the buffers hold. For a connection the stack is
+        /// done with; it holds nothing after.
+        pub fn releaseBuffers(self: *Self) void {
+            self.send.release();
+            self.receiver.releaseBuffer();
         }
 
         // -- State-specific handlers --
@@ -520,7 +566,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             if (!flags.syn) return .none;
 
             // Received SYN: init receiver, transition to SYN_RECEIVED
-            self.receiver = ReceiverT.init(seg_seq, 65535);
+            self.resetReceiver(seg_seq);
             self.state = .syn_received;
 
             // The SYN+ACK below is on the wire as far as the peer is
@@ -560,7 +606,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 }
 
                 // Init receiver with peer's ISN
-                self.receiver = ReceiverT.init(seg_seq, 65535);
+                self.resetReceiver(seg_seq);
                 self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
                 self.state = .established;
 
@@ -575,7 +621,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
             if (flags.syn) {
                 // Simultaneous open
-                self.receiver = ReceiverT.init(seg_seq, 65535);
+                self.resetReceiver(seg_seq);
                 self.state = .syn_received;
                 return .{ .send = .{
                     .flags = .{ .syn = true, .ack = true },
@@ -1575,7 +1621,7 @@ test "Connection: a retransmission after a partial ACK resends the right bytes" 
 
     // The first four bytes are acked, which compacts the send buffer.
     _ = conn.onSegment(12, .{ .ack = true }, 2000, 1005, 65535, &.{});
-    try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[0..conn.send_buf_len]);
+    try testing.expectEqualSlices(u8, "EFGH", conn.sendBytes()[0..conn.send_buf_len]);
 
     // EFGH starts at the front of the buffer now, so that is where the
     // retransmission has to read it from.
@@ -1583,7 +1629,7 @@ test "Connection: a retransmission after a partial ACK resends the right bytes" 
         .send => |seg| {
             try testing.expectEqual(@as(usize, 0), seg.payload_offset);
             try testing.expectEqual(@as(usize, 4), seg.payload_len);
-            try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+            try testing.expectEqualSlices(u8, "EFGH", conn.sendBytes()[seg.payload_offset..][0..seg.payload_len]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1612,7 +1658,7 @@ test "Connection: an ACK in close_wait still consumes the send buffer" {
     switch (conn.poll(14)) {
         .send => |seg| {
             try testing.expectEqual(@as(usize, 4), seg.payload_len);
-            try testing.expectEqualSlices(u8, "IJKL", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+            try testing.expectEqualSlices(u8, "IJKL", conn.sendBytes()[seg.payload_offset..][0..seg.payload_len]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1647,7 +1693,7 @@ test "Connection: a window advertised in close_wait is used" {
     switch (conn.poll(15)) {
         .send => |seg| {
             try testing.expectEqual(@as(u32, 1005), seg.seq);
-            try testing.expectEqualSlices(u8, "EFGH", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+            try testing.expectEqualSlices(u8, "EFGH", conn.sendBytes()[seg.payload_offset..][0..seg.payload_len]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1688,7 +1734,7 @@ test "Connection: sending waits when the retransmit queue is full" {
         .send => |seg| try testing.expectEqualSlices(
             u8,
             msg[capacity .. capacity + seg.payload_len],
-            conn.send_buf[seg.payload_offset..][0..seg.payload_len],
+            conn.sendBytes()[seg.payload_offset..][0..seg.payload_len],
         ),
         else => return error.TestUnexpectedResult,
     }
@@ -1719,7 +1765,7 @@ test "Connection: a partial ACK's fast retransmit is not written over" {
     switch (conn.poll(16)) {
         .send => |seg| {
             try testing.expectEqual(@as(u32, 1009), seg.seq);
-            try testing.expectEqualSlices(u8, "IJKL", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+            try testing.expectEqualSlices(u8, "IJKL", conn.sendBytes()[seg.payload_offset..][0..seg.payload_len]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1741,7 +1787,7 @@ test "Connection: data still unacked when the FIN goes out is retransmitted" {
     switch (conn.poll(3011)) {
         .send => |seg| {
             try testing.expectEqual(@as(u32, 1001), seg.seq);
-            try testing.expectEqualSlices(u8, "ABCD", conn.send_buf[seg.payload_offset..][0..seg.payload_len]);
+            try testing.expectEqualSlices(u8, "ABCD", conn.sendBytes()[seg.payload_offset..][0..seg.payload_len]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1763,7 +1809,7 @@ test "Connection: a fast retransmit asked for after the FIN is served" {
     try testing.expectEqual(@as(?u64, 0), conn.nextPollAt());
 
     switch (conn.poll(12)) {
-        .send => |seg| try testing.expectEqualSlices(u8, "ABCD", conn.send_buf[seg.payload_offset..][0..seg.payload_len]),
+        .send => |seg| try testing.expectEqualSlices(u8, "ABCD", conn.sendBytes()[seg.payload_offset..][0..seg.payload_len]),
         else => return error.TestUnexpectedResult,
     }
     try testing.expect(conn.sender.timer != .fast_retransmit);

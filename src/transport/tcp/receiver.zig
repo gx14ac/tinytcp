@@ -15,6 +15,7 @@
 const std = @import("std");
 const endpoint_mod = @import("endpoint.zig");
 const config_mod = @import("../../config.zig");
+const byte_store = @import("byte_store.zig");
 pub const Config = config_mod.Config;
 
 const seqLt = endpoint_mod.seqLt;
@@ -96,6 +97,7 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         const Self = @This();
 
         const recv_buf_size = cfg.recv_buf_size;
+        const RecvStore = byte_store.ByteStore(recv_buf_size, cfg.grow_buffers, cfg.buf_initial);
         const max_ooo = cfg.max_ooo_segments;
 
         /// Next expected sequence number (left edge of receive window).
@@ -105,8 +107,10 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         /// Initial receive sequence number.
         irs: u32 = 0,
 
-        /// Receive buffer.
-        buf: [recv_buf_size]u8 = undefined,
+        /// Receive buffer: the bytes not yet read from [0, buf_len), then
+        /// those of segments that arrived out of order, at their distance
+        /// past rcv_nxt.
+        store: RecvStore = .{},
         /// Number of valid bytes in the buffer.
         buf_len: usize = 0,
         /// Buffer capacity.
@@ -134,6 +138,16 @@ pub fn ReceiverWith(comptime cfg: Config) type {
 
         /// SACK permitted (negotiated during handshake).
         sack_permitted: bool = false,
+
+        /// Where the buffer's memory comes from, when it grows.
+        pub fn setAllocator(self: *Self, a: std.mem.Allocator) void {
+            self.store.allocator = a;
+        }
+
+        /// Give back what the buffer holds.
+        pub fn releaseBuffer(self: *Self) void {
+            self.store.release();
+        }
 
         /// Initialize receiver with initial receive sequence number.
         pub fn init(irs: u32, win_size: u32) Self {
@@ -274,7 +288,8 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             const copy_len = @min(dst.len, self.buf_len);
             if (copy_len == 0) return 0;
 
-            @memcpy(dst[0..copy_len], self.buf[0..copy_len]);
+            const buf = self.store.slice();
+            @memcpy(dst[0..copy_len], buf[0..copy_len]);
 
             // Shift what is left forward — including the bytes held past
             // buf_len for segments that arrived out of order, which are
@@ -282,10 +297,12 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             // while everything around them moved.
             const held = self.buf_len + self.oooSpan();
             if (copy_len < held) {
-                std.mem.copyForwards(u8, self.buf[0 .. held - copy_len], self.buf[copy_len..held]);
+                std.mem.copyForwards(u8, buf[0 .. held - copy_len], buf[copy_len..held]);
             }
 
             self.buf_len -= copy_len;
+            // Read down to what fits in the small buffer: back to it.
+            self.store.shrink(held - copy_len);
 
             // Grow window
             self.rcv_wnd += @intCast(copy_len);
@@ -350,10 +367,17 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         /// Deliver payload directly to the receive buffer (in-order).
         fn deliverInOrder(self: *Self, payload: []const u8) usize {
             const space = self.buf_cap - self.buf_len;
-            const copy_len = @min(payload.len, space);
+            var copy_len = @min(payload.len, space);
             if (copy_len == 0) return 0;
+            // Room for it, keeping what is unread and what is held for the
+            // segments out of order past it. Short of memory, as much as
+            // fits; the peer sends the rest again.
+            if (!self.store.ensure(self.buf_len + copy_len, self.buf_len + self.oooSpan())) {
+                copy_len = @min(copy_len, self.store.slice().len -| self.buf_len);
+                if (copy_len == 0) return 0;
+            }
 
-            @memcpy(self.buf[self.buf_len .. self.buf_len + copy_len], payload[0..copy_len]);
+            @memcpy(self.store.slice()[self.buf_len .. self.buf_len + copy_len], payload[0..copy_len]);
             self.buf_len += copy_len;
             self.rcv_nxt +%= @intCast(copy_len);
             self.rcv_wnd -|= @intCast(copy_len);
@@ -411,7 +435,8 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             // Remembering it would have reassembly acknowledge data that was
             // never stored, and the peer has to send it again either way.
             if (buf_pos + payload.len > self.buf_cap) return;
-            @memcpy(self.buf[buf_pos .. buf_pos + payload.len], payload);
+            if (!self.store.ensure(buf_pos + payload.len, self.buf_len + self.oooSpan())) return;
+            @memcpy(self.store.slice()[buf_pos .. buf_pos + payload.len], payload);
 
             // Try to merge with existing OOO segments
             for (&self.ooo) |*seg| {
