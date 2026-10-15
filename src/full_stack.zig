@@ -1963,7 +1963,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// Stateless SYN+ACK using SYN cookie (no connection state allocated).
         fn acceptConnStateless(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_wnd: u16) Event {
             _ = peer_wnd;
-            const cookie_isn = self.syn_cookie.generate(now_ms, id.remote_addr, id.remote_port, id.local_addr, id.local_port, 1460);
+            // This side's MSS, not Ethernet's: what the cookie brings back is
+            // what the connection sends with.
+            const cookie_isn = self.syn_cookie.generate(now_ms, id.remote_addr, id.remote_port, id.local_addr, id.local_port, cfg.default_mss);
 
             // Send SYN+ACK with cookie as ISN, no state allocated
             self.buildAndSend(id, .{ .syn = true, .ack = true }, cookie_isn, peer_seq +% 1, 65535, &.{});
@@ -1997,6 +1999,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             const idx = self.allocSlot() orelse return .none;
             const our_isn = seg_ack -% 1;
+            // No larger than this side's own, whatever the cookie carried:
+            // a segment past it would not fit this side's link.
+            const mss = @min(cookie_mss, cfg.default_mss);
 
             const slot = self.slotAt(idx);
             slot.id = id;
@@ -2012,9 +2017,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .state = .established,
                 .local_port = id.local_port,
                 .remote_port = id.remote_port,
-                .sender = SenderT.init(our_isn, cookie_mss),
+                .sender = SenderT.init(our_isn, mss),
                 .receiver = ReceiverT.init(seg_seq -% 1, @intCast(@min(cfg.recv_buf_size, 65535))),
-                .mss = cookie_mss,
+                .mss = mss,
                 .last_activity_ms = now_ms,
             };
             slot.conn.sender.syn_sent = true;
@@ -4973,3 +4978,42 @@ test "FullStack: on an Ethernet-sized link, what used to be dropped now goes in 
     try testing.expectEqual(@as(usize, 2), got.fragments);
     try testing.expectEqual(@as(usize, 2008), got.len);
 }
+
+test "FullStack: a connection a cookie accepted sends no segment past this side's MSS" {
+    // Under a burst the stack answers SYNs with cookies, and what the
+    // cookie carried was Ethernet's 1460 whatever this side could take:
+    // on a 1280-byte link every full segment was too large to send.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelSmallMss.init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listen(80, 128);
+    stack.syn_cookie_threshold = 0;
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(10, pkt_buf[0..syn]);
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    const idx = switch (stack.injectPacket(20, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Plenty to send: every segment it makes fits 1240 of data.
+    var big: [8000]u8 = undefined;
+    @memset(&big, 'x');
+    _ = stack.write(idx, &big);
+    var now: u64 = 30;
+    var segments: usize = 0;
+    while (now < 3000) : (now += 50) {
+        _ = stack.poll(now);
+        while (link_ep.readOutbound(&out_buf)) |pkt| {
+            try testing.expect(pkt.len <= 1280);
+            segments += 1;
+        }
+    }
+    try testing.expect(segments > 0);
+    try testing.expect(stack.conns[idx].conn.sender.mss <= 1240);
+}
+
+const TunnelSmallMss = FullStackWith(16, .{ .link_mtu = 1280, .default_mss = 1240 });

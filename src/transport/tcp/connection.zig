@@ -801,7 +801,19 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             if (opts.timestamps_enabled) {
                 self.timestamps_enabled = true;
             }
+
+            // The MSS counts no options, and every data segment here
+            // carries the timestamp's 12 bytes when they are on: what goes
+            // in a segment is the MSS less those, or it is 12 bytes past
+            // what the path takes (RFC 7323 3, RFC 6691).
+            if (self.timestamps_enabled) {
+                self.sender.setMss(self.mss -| timestamp_option_len);
+            }
         }
+
+        /// What every segment after the handshake carries when timestamps
+        /// are on: two NOPs and the option (options.writeTimestamp).
+        const timestamp_option_len: u16 = 12;
 
         /// PAWS (Protection Against Wrapped Sequences) check.
         /// Returns true if the segment should be REJECTED (TSval is too old).
@@ -1927,4 +1939,16 @@ test "Connection: the MSS sent with is the smaller of the peer's and this side's
     const small_peer = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1000 });
     try testing.expectEqual(@as(u16, 1000), small_peer.mss);
     try testing.expectEqual(@as(u16, 1000), small_peer.sender.mss);
+}
+
+test "Connection: with timestamps on, a segment's data leaves room for them" {
+    // 1240 of data, the timestamp's 12 and 40 of headers would be 1292 on
+    // a 1280 link. The MSS stays what was agreed; what is put in a segment
+    // is 12 less.
+    const Small = ConnectionWith(.{ .default_mss = 1240 });
+    const ts = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1460, .timestamps_enabled = true });
+    try testing.expectEqual(@as(u16, 1240), ts.mss);
+    try testing.expectEqual(@as(u16, 1228), ts.sender.mss);
+    const no_ts = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1460 });
+    try testing.expectEqual(@as(u16, 1240), no_ts.sender.mss);
 }
