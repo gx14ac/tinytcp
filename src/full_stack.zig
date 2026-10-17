@@ -5484,3 +5484,63 @@ test "FullStack: UDP over IPv6 larger than the link goes in fragments" {
     try testing.expectEqual(@as(usize, 1280), whole.len);
     try testing.expectEqual(@as(u8, 17), whole[6]);
 }
+
+// ================================================================
+// A reset in the closing states
+// ================================================================
+
+test "FullStack: a reset ends a connection in any closing state, and gives its slot back" {
+    // close_wait, fin_wait_2, last_ack and closing ignored a reset: the
+    // connection stayed, retransmitting to a peer that had dropped it or
+    // waiting for a FIN that was never coming, and held its slot.
+    const peer: [4]u8 = .{ 10, 0, 0, 2 };
+    const us: [4]u8 = .{ 10, 0, 0, 1 };
+    const states = [_]tcp_connection.State{ .close_wait, .fin_wait_2, .last_ack, .closing };
+    for (states) |want| {
+        var link_ep = link_mod.ChannelEndpoint.init();
+        var stack = FullStack(16).init(&link_ep, us);
+        _ = stack.listen(80, 16);
+        const idx = try growAccept(FullStack(16), &stack, &link_ep, 6000);
+        var pkt_buf: [128]u8 = undefined;
+        var out_buf: [1600]u8 = undefined;
+        const ours = stack.conns[idx].conn.sender.snd_nxt;
+        var peer_seq: u32 = 3001;
+        var now: u64 = 30;
+
+        // The peer's FIN first, for close_wait and last_ack; this side's
+        // close then, for the other three.
+        if (want == .close_wait or want == .last_ack) {
+            const fin = buildTcpPacket(peer, 6000, us, 80, peer_seq, ours, .{ .fin = true, .ack = true }, 65535, &.{}, &pkt_buf);
+            _ = stack.injectPacket(now, pkt_buf[0..fin]);
+            peer_seq +%= 1;
+        }
+        if (want != .close_wait) {
+            stack.close(idx);
+            now += 10;
+            _ = stack.poll(now);
+        }
+        while (link_ep.readOutbound(&out_buf)) |_| {}
+        switch (want) {
+            // The peer takes this side's FIN.
+            .fin_wait_2 => {
+                const ack = buildTcpPacket(peer, 6000, us, 80, peer_seq, ours +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+                _ = stack.injectPacket(now, pkt_buf[0..ack]);
+            },
+            // The peer's FIN crosses this side's, which it has not yet seen.
+            .closing => {
+                const fin = buildTcpPacket(peer, 6000, us, 80, peer_seq, ours, .{ .fin = true, .ack = true }, 65535, &.{}, &pkt_buf);
+                _ = stack.injectPacket(now, pkt_buf[0..fin]);
+                peer_seq +%= 1;
+            },
+            else => {},
+        }
+        try testing.expectEqual(want, stack.conns[idx].conn.state);
+
+        const rst = buildTcpPacket(peer, 6000, us, 80, peer_seq, 0, .{ .rst = true }, 0, &.{}, &pkt_buf);
+        switch (stack.injectPacket(now + 1, pkt_buf[0..rst])) {
+            .aborted => |i| try testing.expectEqual(idx, i),
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expect(!stack.conns[idx].active);
+    }
+}

@@ -253,6 +253,19 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
         /// Process an incoming TCP segment.
         pub fn onSegment(self: *Self, now_ms: u64, flags: tcp_header.Flags, seg_seq: u32, seg_ack: u32, seg_wnd: u16, payload: []const u8) Output {
+            // A reset ends a connection that is closing as it ends one that
+            // is open (RFC 9293 3.10.7.4). These four ignored it: the
+            // connection stayed, sending to a peer that had dropped it or
+            // waiting for a FIN that was never coming, and held its slot
+            // until a timer gave up. Not in time_wait, which RFC 1337 has
+            // ignore one.
+            switch (self.state) {
+                .fin_wait_2, .close_wait, .last_ack, .closing => if (flags.rst) {
+                    self.state = .closed;
+                    return .aborted;
+                },
+                else => {},
+            }
             switch (self.state) {
                 .closed => {
                     if (flags.rst) return .none;
