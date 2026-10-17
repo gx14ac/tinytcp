@@ -257,8 +257,8 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             // is open (RFC 9293 3.10.7.4). These four ignored it: the
             // connection stayed, sending to a peer that had dropped it or
             // waiting for a FIN that was never coming, and held its slot
-            // until a timer gave up. Not in time_wait, which RFC 1337 has
-            // ignore one.
+            // until a timer gave up. Not in time_wait: RFC 1337 has a reset
+            // there ignored.
             switch (self.state) {
                 .fin_wait_2, .close_wait, .last_ack, .closing => if (flags.rst) {
                     self.state = .closed;

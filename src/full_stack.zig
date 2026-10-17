@@ -125,6 +125,10 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             is_v6: bool = false,
             local_addr6: [16]u8 = .{0} ** 16,
             remote_addr6: [16]u8 = .{0} ** 16,
+            /// Which connection this is, of all the ones this slot has
+            /// held (connGen). Set when the slot is taken; 0 for one never
+            /// taken.
+            gen: u32 = 0,
         };
 
         const max_udp_endpoints: usize = cfg.max_udp_endpoints;
@@ -240,6 +244,10 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// The identification of the next IPv6 datagram this stack
         /// fragments (emitUdpFragments6).
         ip6_frag_id: u32 = 1,
+        /// The generation the next connection is given (ConnSlot.gen).
+        /// Stack-wide rather than per slot: a slot is written over whole
+        /// when it is taken, and a count kept in it would go with it.
+        next_conn_gen: u32 = 1,
         // Per-instance ephemeral port counter (49152–65535)
         ephemeral_port_counter: u16 = 49152,
         // Last timestamp passed to tick/injectPacket (for outbound timestamping)
@@ -319,6 +327,16 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             }
             self.slots_ready = 0;
             self.active_count = 0;
+        }
+
+        /// A connection was just made in `slot`: give it its generation, and
+        /// the stack's allocator for its buffers to grow from.
+        fn openedSlot(self: *Self, slot: *ConnSlot) void {
+            slot.gen = self.next_conn_gen;
+            // Never 0, which a slot never taken reads as.
+            self.next_conn_gen +%= 1;
+            if (self.next_conn_gen == 0) self.next_conn_gen = 1;
+            self.adoptBuffers(slot);
         }
 
         /// Hand a connection just made in `slot` the stack's allocator, for
@@ -1005,7 +1023,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .active = true,
             };
             slot.conn.limitLocalMss(mss4);
-            self.adoptBuffers(slot);
+            self.openedSlot(slot);
             self.active_count += 1;
             self.hashInsert(idx);
             return @intCast(idx);
@@ -1043,7 +1061,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .remote_addr6 = remote_addr,
             };
             slot.conn.limitLocalMss(mss6);
-            self.adoptBuffers(slot);
+            self.openedSlot(slot);
             self.active_count += 1;
             self.hashInsert(idx);
             return @intCast(idx);
@@ -1053,6 +1071,17 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         pub fn connState(self: *const Self, conn_idx: u16) ?tcp_connection.State {
             const slot = self.liveSlot(conn_idx) orelse return null;
             return slot.conn.state;
+        }
+
+        /// Which connection holds `conn_idx`: a number that is different for
+        /// every connection the slot holds, and null once it holds none. A
+        /// slot is given to the next connection as soon as one closes —
+        /// a reset closes it without the caller doing anything — so an
+        /// index kept from earlier says nothing about whose it is now; the
+        /// index and this number together do.
+        pub fn connGen(self: *const Self, conn_idx: u16) ?u32 {
+            const slot = self.liveSlot(conn_idx) orelse return null;
+            return slot.gen;
         }
 
         /// Get connection ID.
@@ -1878,7 +1907,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             slot.local_addr6 = if (v6) |a| a.local else .{0} ** 16;
             slot.remote_addr6 = if (v6) |a| a.remote else .{0} ** 16;
             slot.conn = ConnectionT.acceptFromSynMss(id.local_port, isn, now_ms, peer_opts, localMss(v6 != null));
-            self.adoptBuffers(slot);
+            self.openedSlot(slot);
 
             // Process the SYN — produces SYN+ACK output
             const output = slot.conn.onSegment(now_ms, .{ .syn = true }, peer_seq, 0, peer_wnd, &.{});
@@ -2147,7 +2176,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .local_mss = local,
                 .last_activity_ms = now_ms,
             };
-            self.adoptBuffers(slot);
+            self.openedSlot(slot);
             slot.conn.sender.syn_sent = true;
             slot.conn.sender.syn_acked = true;
             slot.conn.sender.snd_nxt = our_isn +% 1;
@@ -5543,4 +5572,33 @@ test "FullStack: a reset ends a connection in any closing state, and gives its s
         }
         try testing.expect(!stack.conns[idx].active);
     }
+}
+
+test "FullStack: a slot taken again after a reset is told apart by its generation" {
+    // The stack gives a closed slot to the next connection, and a reset
+    // closes one without the caller doing anything. An index kept from
+    // before then names the new connection; the generation says it is not
+    // the same one.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listen(80, 4);
+    const first = try growAccept(FullStack(4), &stack, &link_ep, 6000);
+    const first_gen = stack.connGen(first).?;
+    try testing.expect(first_gen != 0);
+
+    var pkt_buf: [128]u8 = undefined;
+    const rst = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, 0, .{ .rst = true }, 0, &.{}, &pkt_buf);
+    _ = stack.injectPacket(40, pkt_buf[0..rst]);
+    try testing.expectEqual(@as(?u32, null), stack.connGen(first));
+
+    var out_buf: [1600]u8 = undefined;
+    while (link_ep.readOutbound(&out_buf)) |_| {}
+    const second = try growAccept(FullStack(4), &stack, &link_ep, 6001);
+    try testing.expectEqual(first, second);
+    try testing.expect(stack.connGen(second).? != first_gen);
+
+    // An outbound connection is given one too.
+    const out = stack.connect(50, .{ 10, 0, 0, 9 }, 443, 50000).?;
+    try testing.expect(stack.connGen(out).? != 0);
+    try testing.expect(stack.connGen(out).? != stack.connGen(second).?);
 }
