@@ -196,7 +196,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             if (self.state != .established and self.state != .close_wait) return 0;
             // Room for all of it, if the buffer may grow that far; what it
             // cannot take is the caller's to offer again.
-            _ = self.send.ensure(@min(self.send_buf_len + data.len, conn_send_buf_size), self.send_buf_len);
+            self.send.ensureUpTo(@min(self.send_buf_len + data.len, conn_send_buf_size), self.send_buf_len);
             const buf = self.send.slice();
             const space = buf.len - self.send_buf_len;
             const copy_len = @min(data.len, space);
@@ -532,8 +532,21 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             // Whatever is left in flight starts that much earlier in the
             // buffer now, and a retransmission reads it by offset.
             self.sender.shiftBufOffsets(acked_bytes);
-            // Drained, or nearly: back to the small buffer.
-            self.send.shrink(self.send_buf_len);
+        }
+
+        /// Give back what the buffers grew to, once they are drained and no
+        /// segment has come for cfg.buf_shrink_idle_ms: a connection gone
+        /// quiet goes back to costing little, and one still moving data
+        /// keeps what it will need again for the next burst. For the
+        /// stack's poll.
+        pub fn shrinkIdleBuffers(self: *Self, now_ms: u64) void {
+            if (comptime !cfg.grow_buffers) return;
+            const send_can = self.send.canShrink(self.send_buf_len);
+            const recv_can = self.receiver.canShrinkBuffer();
+            if (!send_can and !recv_can) return;
+            if (now_ms -| self.last_activity_ms < cfg.buf_shrink_idle_ms) return;
+            if (send_can) self.send.shrink(self.send_buf_len);
+            if (recv_can) self.receiver.shrinkBuffer();
         }
 
         /// The bytes from snd_una on: in flight, then not yet sent. What a

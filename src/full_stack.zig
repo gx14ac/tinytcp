@@ -21,6 +21,7 @@ const ipv6_frag_mod = @import("ipv6_frag.zig");
 const icmp_header = @import("header/icmp.zig");
 const ipv6_header = @import("header/ipv6.zig");
 const tcp_connection = @import("transport/tcp/connection.zig");
+const byte_store = @import("transport/tcp/byte_store.zig");
 const tcp_sender = @import("transport/tcp/sender.zig");
 const tcp_receiver = @import("transport/tcp/receiver.zig");
 const tcp_header = @import("header/tcp.zig");
@@ -196,6 +197,11 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// Where chunks come from. Null for an inline stack, and a chunked
         /// one without it has no slots to give.
         allocator: ?std.mem.Allocator = null,
+        /// What every connection's buffers come from when they grow: the
+        /// allocator above, held to cfg.buf_budget. Connections point into
+        /// it, which is one more reason the stack is written in place
+        /// (initAlloc) and never moved after.
+        buf_budget: if (cfg.grow_buffers) byte_store.Budget else void = if (cfg.grow_buffers) .{ .parent = std.mem.Allocator.failing } else {},
         conn_hash: [hash_capacity]u16 = [_]u16{empty_slot} ** hash_capacity,
         active_count: usize = 0,
         // Listen state (up to 8 simultaneous listen ports)
@@ -285,7 +291,15 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .isn_gen = isn_mod.IsnGenerator.init(secret),
                 .syn_cookie = syn_cookie_mod.SynCookie.init(secret),
                 .allocator = allocator,
+                .buf_budget = if (cfg.grow_buffers) .{ .parent = allocator, .limit = cfg.buf_budget } else {},
             };
+        }
+
+        /// What every connection's grown buffers hold now, in bytes
+        /// (cfg.grow_buffers; 0 otherwise). Against cfg.buf_budget, it says
+        /// how close the stack is to taking less than it is sent.
+        pub fn bufBytesHeld(self: *const Self) usize {
+            return if (comptime cfg.grow_buffers) self.buf_budget.used else 0;
         }
 
         /// Give the chunks back, and what open connections hold. Nothing
@@ -311,7 +325,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// its buffers to grow from.
         fn adoptBuffers(self: *Self, slot: *ConnSlot) void {
             if (comptime !cfg.grow_buffers) return;
-            if (self.allocator) |a| slot.conn.setAllocator(a);
+            if (self.allocator != null) slot.conn.setAllocator(self.buf_budget.allocator());
         }
 
         fn SlotPtr(comptime P: type) type {
@@ -763,6 +777,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 if (!slot.active) continue;
 
                 const in_syn_queue = inSynQueue(slot);
+                slot.conn.shrinkIdleBuffers(now_ms);
                 const output = slot.conn.poll(now_ms);
                 switch (output) {
                     .send => |seg| {
@@ -5135,7 +5150,7 @@ const GrowStack = FullStackWith(16, .{ .grow_buffers = true, .send_buf_size = 25
 
 /// A connection to `stack` on port 80 from 10.0.0.2:`port`, through the
 /// whole handshake.
-fn growAccept(stack: *GrowStack, link_ep: *link_mod.ChannelEndpoint, port: u16) !u16 {
+fn growAccept(comptime S: type, stack: *S, link_ep: *link_mod.ChannelEndpoint, port: u16) !u16 {
     var pkt_buf: [128]u8 = undefined;
     var out_buf: [1600]u8 = undefined;
     const syn = buildTcpPacket(.{ 10, 0, 0, 2 }, port, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
@@ -5148,13 +5163,13 @@ fn growAccept(stack: *GrowStack, link_ep: *link_mod.ChannelEndpoint, port: u16) 
     };
 }
 
-test "FullStack grow_buffers: a connection takes more than it starts with, and gives it back drained" {
+test "FullStack grow_buffers: a connection takes more than it starts with, and gives it back once quiet" {
     var link_ep = link_mod.ChannelEndpoint.init();
     var stack: GrowStack = undefined;
     stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{6} ** 16, testing.allocator);
     defer stack.deinit();
     _ = stack.listen(80, 16);
-    const idx = try growAccept(&stack, &link_ep, 6000);
+    const idx = try growAccept(GrowStack, &stack, &link_ep, 6000);
 
     // Far past 64KiB, which is all a fixed buffer of the default size took.
     var big: [100_000]u8 = undefined;
@@ -5179,6 +5194,14 @@ test "FullStack grow_buffers: a connection takes more than it starts with, and g
         }
     }
     try testing.expectEqual(big.len, acked);
+    // Drained, but the peer spoke a moment ago: kept for the next burst,
+    // rather than given back and allocated again.
+    try testing.expect(stack.conns[idx].conn.send.heap.len >= big.len);
+    _ = stack.poll(now + 500);
+    try testing.expect(stack.conns[idx].conn.send.heap.len >= big.len);
+    // Quiet for buf_shrink_idle_ms: back to the first size.
+    now += 1000;
+    _ = stack.poll(now);
     try testing.expectEqual(@as(usize, 4096), stack.conns[idx].conn.send.heap.len);
 
     // The other way: more than the first 4KiB arrives, is read, and the
@@ -5196,7 +5219,31 @@ test "FullStack grow_buffers: a connection takes more than it starts with, and g
     try testing.expect(stack.conns[idx].conn.receiver.store.heap.len >= 5 * chunk.len);
     var read_buf: [8000]u8 = undefined;
     try testing.expectEqual(@as(usize, 5 * chunk.len), stack.read(idx, &read_buf));
+    try testing.expect(stack.conns[idx].conn.receiver.store.heap.len >= 5 * chunk.len);
+    _ = stack.poll(now + 1000);
     try testing.expectEqual(@as(usize, 4096), stack.conns[idx].conn.receiver.store.heap.len);
+}
+
+test "FullStack grow_buffers: what every connection holds stays within buf_budget" {
+    const Budgeted = FullStackWith(16, .{ .grow_buffers = true, .send_buf_size = 256 * 1024, .buf_initial = 4096, .buf_budget = 64 * 1024 });
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack: Budgeted = undefined;
+    stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{9} ** 16, testing.allocator);
+    defer stack.deinit();
+    _ = stack.listen(80, 16);
+
+    // Each could take 256KiB; together they get 64KiB, and whatever does
+    // not fit is refused rather than allocated.
+    var big: [100_000]u8 = undefined;
+    @memset(&big, 'b');
+    var took: usize = 0;
+    for (0..4) |i| {
+        const idx = try growAccept(Budgeted, &stack, &link_ep, 6200 + @as(u16, @intCast(i)));
+        took += stack.write(idx, &big);
+        try testing.expect(stack.bufBytesHeld() <= 64 * 1024);
+    }
+    try testing.expect(took > 0);
+    try testing.expect(took < 4 * big.len);
 }
 
 test "FullStack grow_buffers: a connection reset while it holds data gives its memory back" {
@@ -5211,7 +5258,7 @@ test "FullStack grow_buffers: a connection reset while it holds data gives its m
 
     for (0..3) |round| {
         const port: u16 = 6000 + @as(u16, @intCast(round));
-        const idx = try growAccept(&stack, &link_ep, port);
+        const idx = try growAccept(GrowStack, &stack, &link_ep, port);
         var big: [20_000]u8 = undefined;
         @memset(&big, 'z');
         try testing.expectEqual(@as(usize, big.len), stack.write(idx, &big));
@@ -5230,7 +5277,7 @@ test "FullStack grow_buffers: connections open at the end are given back with th
     stack.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, .{8} ** 16, testing.allocator);
     defer stack.deinit();
     _ = stack.listen(80, 16);
-    const idx = try growAccept(&stack, &link_ep, 6100);
+    const idx = try growAccept(GrowStack, &stack, &link_ep, 6100);
     var big: [20_000]u8 = undefined;
     @memset(&big, 'w');
     try testing.expectEqual(@as(usize, big.len), stack.write(idx, &big));
