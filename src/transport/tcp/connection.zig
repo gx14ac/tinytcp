@@ -640,7 +640,11 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
                 // Init receiver with peer's ISN
                 self.resetReceiver(seg_seq);
-                self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
+                // As it is: a SYN+ACK's window is never scaled (RFC 7323
+                // 2.2), any more than the one this side's SYN carried.
+                // Shifted, a 64KiB window read as 8MiB for the first round
+                // trip.
+                self.sender.setRemoteWindow(@as(u32, seg_wnd));
                 self.state = .established;
 
                 // Send ACK
@@ -753,9 +757,12 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
             }
 
-            // Process data
+            // Process data. The peer still sends after this side's FIN, so
+            // it still probes a window this side closed, as in established.
             if (payload.len > 0) {
                 _ = self.receiver.onSegment(seg_seq, payload);
+            } else if (!flags.fin) {
+                self.receiver.onEmptySegment(seg_seq);
             }
 
             if (flags.fin) {
@@ -785,8 +792,12 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
         fn onSegmentFinWait2(self: *Self, now_ms: u64, flags: tcp_header.Flags, seg_seq: u32, payload: []const u8) Output {
             _ = now_ms;
+            // Half-closed by this side only: the peer still sends, and
+            // probes a closed window (onEmptySegment), as in established.
             if (payload.len > 0) {
                 _ = self.receiver.onSegment(seg_seq, payload);
+            } else if (!flags.fin) {
+                self.receiver.onEmptySegment(seg_seq);
             }
 
             if (flags.fin) {
@@ -2121,4 +2132,37 @@ test "Connection: a link smaller than default_mss holds the offer and what is se
     const small_peer = Connection.acceptFromSynMss(80, 1000, 0, .{ .mss = 900 }, 1220);
     try testing.expectEqual(@as(u16, 900), small_peer.sender.mss);
     try testing.expectEqual(@as(u16, 1220), small_peer.local_mss);
+}
+
+test "Connection: a probe is answered after this side's FIN too" {
+    // The peer still sends once this side has closed its half, and still
+    // probes a window this side closed: unanswered, it stops for good.
+    inline for (.{ State.fin_wait_1, State.fin_wait_2 }) |st| {
+        var conn = makeEstablished();
+        conn.state = st;
+        _ = conn.onSegment(10, .{ .ack = true }, conn.receiver.rcv_nxt -% 1, 1001, 65535, &.{});
+        try testing.expect(conn.receiver.ack_needed);
+        try testing.expectEqual(@as(?u64, 0), conn.nextPollAt());
+    }
+}
+
+/// The window the peer is taken to have offered (for tests).
+fn remoteWindowOf(conn: *const Connection) usize {
+    return switch (conn.sender.congestion) {
+        inline else => |cc| if (@hasField(@TypeOf(cc), "rwnd")) cc.rwnd else 0,
+    };
+}
+
+test "Connection: a SYN+ACK's window is read as it is, though scaling was agreed" {
+    var conn = Connection.connect(5000, 80, 1000);
+    _ = conn.poll(0); // the SYN
+    conn.applyPeerOptions(.{ .mss = 1460, .window_scale = 7, .window_scale_offered = true });
+    try testing.expect(conn.wscale_enabled);
+    _ = conn.onSegment(10, .{ .syn = true, .ack = true }, 9000, 1001, 65535, &.{});
+    try testing.expectEqual(State.established, conn.state);
+    try testing.expectEqual(@as(usize, 65535), remoteWindowOf(&conn));
+
+    // After it, the scale applies.
+    _ = conn.onSegment(20, .{ .ack = true }, 9001, 1001, 1000, &.{});
+    try testing.expectEqual(@as(usize, 1000 << 7), remoteWindowOf(&conn));
 }
