@@ -149,6 +149,19 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             self.store.release();
         }
 
+        /// Whether what is held — unread, and out of order past it — fits
+        /// the small buffer, which is then worth going back to.
+        pub fn canShrinkBuffer(self: *const Self) bool {
+            // The size first: oooSpan walks every out-of-order slot.
+            if (!self.store.canShrink(0)) return false;
+            return self.store.canShrink(self.buf_len + self.oooSpan());
+        }
+
+        /// Back to the small buffer, keeping what is held.
+        pub fn shrinkBuffer(self: *Self) void {
+            self.store.shrink(self.buf_len + self.oooSpan());
+        }
+
         /// Initialize receiver with initial receive sequence number.
         pub fn init(irs: u32, win_size: u32) Self {
             return Self{
@@ -302,8 +315,6 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             }
 
             self.buf_len -= copy_len;
-            // Read down to what fits in the small buffer: back to it.
-            self.store.shrink(held - copy_len);
 
             // Grow window
             self.rcv_wnd += @intCast(copy_len);
