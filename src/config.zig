@@ -14,6 +14,29 @@ pub const Config = struct {
     /// TCP receive buffer size per connection (bytes).
     recv_buf_size: usize = 65536,
 
+    /// Keep each connection's send and receive bytes in memory from the
+    /// stack's allocator, grown to what the connection holds and given
+    /// back once it is drained, rather than in arrays of the sizes above
+    /// inside every connection. The sizes above become the most a
+    /// connection may hold. Needs a stack built with initAlloc.
+    grow_buffers: bool = false,
+
+    /// What a grown buffer goes back to once drained.
+    buf_initial: usize = 4096,
+
+    /// How long a connection goes without a segment before its drained
+    /// buffers go back to buf_initial. Not at once: a transfer drains its
+    /// buffer between one burst and the next, and giving it back each
+    /// time would allocate it again each time, in the middle of moving
+    /// packets.
+    buf_shrink_idle_ms: u64 = 1000,
+
+    /// The most every connection's grown buffers hold together, in bytes;
+    /// 0 for no limit. Past it a write accepts less and a segment that
+    /// needs more room is not taken (the peer sends it again), as when
+    /// the allocator itself refuses.
+    buf_budget: usize = 0,
+
     /// Maximum out-of-order segments tracked per connection.
     max_ooo_segments: usize = 32,
 

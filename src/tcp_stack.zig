@@ -210,7 +210,7 @@ pub fn TcpStack(comptime max_conns: usize) type {
             if (conn_idx >= max_conns) return null;
             const slot = &self.conns[conn_idx];
             if (!slot.active) return null;
-            return slot.conn.send_buf[0..slot.conn.send_buf_len];
+            return slot.conn.sendBytes()[0..slot.conn.send_buf_len];
         }
 
         /// Next time poll() should be called.
