@@ -300,6 +300,7 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         pub fn read(self: *Self, dst: []u8) usize {
             const copy_len = @min(dst.len, self.buf_len);
             if (copy_len == 0) return 0;
+            const window_before = self.windowRaw();
 
             const buf = self.store.slice();
             @memcpy(dst[0..copy_len], buf[0..copy_len]);
@@ -317,12 +318,45 @@ pub fn ReceiverWith(comptime cfg: Config) type {
 
             // Grow window
             self.rcv_wnd += @intCast(copy_len);
+
+            // Tell the peer when reading has opened the window to twice
+            // what it was, and by at least a segment's worth. Nothing else
+            // would: a window the peer saw close stays closed for it until
+            // this side sends something, and a peer with nothing to say
+            // waits on its persist timer — and on a probe being answered —
+            // before sending again. Twice, as Linux does, so a reader
+            // taking a little at a time does not send an update for each.
+            const window_after = self.windowRaw();
+            if (window_after -| window_before >= self.swsThreshold() and window_after >= 2 * window_before) {
+                self.ack_needed = true;
+            }
             return copy_len;
+        }
+
+        /// A segment with nothing in it, other than a SYN or FIN. One that
+        /// is not acceptable (RFC 9293 3.10.7.4) is answered: a peer probing
+        /// a closed window sends one from just behind rcv_nxt, and the
+        /// answer is how it learns the window has opened again.
+        pub fn onEmptySegment(self: *Self, seg_seq: u32) void {
+            if (seg_seq == self.rcv_nxt) return;
+            if (seqGt(seg_seq, self.rcv_nxt) and seg_seq -% self.rcv_nxt < self.windowRaw()) return;
+            self.ack_needed = true;
+            self.immediate_ack = true;
         }
 
         /// Get available receive buffer space.
         pub fn available(self: *const Self) usize {
             return self.buf_cap - self.buf_len;
+        }
+
+        /// The least the window opens by before it is advertised (SWS
+        /// avoidance, RFC 1122 4.2.3.3): a segment, or half the buffer.
+        fn swsThreshold(self: *const Self) usize {
+            const effective_cap = if (self.auto_tune.enabled)
+                @min(self.auto_tune.target_buf, self.buf_cap)
+            else
+                self.buf_cap;
+            return @min(@as(usize, 1460), effective_cap / 2);
         }
 
         /// Get current receive window as raw u32 (before scaling).
@@ -335,7 +369,7 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             else
                 self.buf_cap;
             const free = effective_cap -| (self.buf_len + self.oooSpan());
-            const threshold = @min(@as(usize, 1460), effective_cap / 2);
+            const threshold = self.swsThreshold();
             const effective: u32 = if (free < threshold) 0 else @intCast(@min(free, std.math.maxInt(u32)));
             return effective;
         }
@@ -779,4 +813,45 @@ test "Receiver: a FIN behind what is already held still closes the stream" {
     var buf: [16]u8 = undefined;
     try testing.expectEqual(@as(usize, 4), rx.read(&buf));
     try testing.expectEqualStrings("abcd", buf[0..4]);
+}
+
+test "Receiver: a read that opens a closed window owes the peer an update, and a small one does not" {
+    const Rx = ReceiverWith(.{ .recv_buf_size = 8192, .auto_tune_enabled = false });
+    var rx = Rx.init(1000, 8192);
+    var seg: [1024]u8 = undefined;
+    @memset(&seg, 'a');
+    var seq: u32 = 1001;
+    for (0..8) |_| {
+        _ = rx.onSegment(seq, &seg);
+        seq +%= seg.len;
+    }
+    try testing.expectEqual(@as(u32, 0), rx.windowRaw());
+    _ = rx.consumeAckNeeded();
+
+    // Less than a segment's worth: the window stays shut on the wire.
+    var out: [8192]u8 = undefined;
+    _ = rx.read(out[0..100]);
+    try testing.expect(!rx.ack_needed);
+
+    // Open again: the peer that saw it close is told.
+    _ = rx.read(out[0..4000]);
+    try testing.expect(rx.ack_needed);
+    _ = rx.consumeAckNeeded();
+
+    // Wider by more than a segment, but not twice as wide: no update for
+    // every read.
+    _ = rx.read(out[0..2000]);
+    try testing.expect(!rx.ack_needed);
+}
+
+test "Receiver: a probe from behind rcv_nxt is answered, a plain ACK is not" {
+    var rx = Receiver.init(1000, 65535);
+    _ = rx.onSegment(1001, "hello");
+    _ = rx.consumeAckNeeded();
+
+    rx.onEmptySegment(rx.rcv_nxt);
+    try testing.expect(!rx.ack_needed);
+
+    rx.onEmptySegment(rx.rcv_nxt -% 1);
+    try testing.expect(rx.ack_needed);
 }
