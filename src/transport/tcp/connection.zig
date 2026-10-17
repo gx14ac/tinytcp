@@ -134,6 +134,11 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
         // Negotiated options
         mss: u16 = cfg.default_mss,
+        /// The largest segment this side's link carries: what its SYN
+        /// offers, and the most it sends whatever the peer offers.
+        /// cfg.default_mss, or less where the header is larger (IPv6):
+        /// the stack lowers it before the handshake (limitLocalMss).
+        local_mss: u16 = cfg.default_mss,
         /// Send window scale (peer's shift count, applied to received window)
         snd_wscale: u4 = 0,
         /// Receive window scale (our shift count, applied to advertised window)
@@ -165,11 +170,19 @@ pub fn ConnectionWith(comptime cfg: Config) type {
 
         /// Initialize a server-side connection from an inbound SYN (sets up sender state + retx entry).
         pub fn acceptFromSyn(local_port: u16, isn: u32, now_ms: u64, peer_opts: options_mod.NegotiatedOptions) Self {
+            return acceptFromSynMss(local_port, isn, now_ms, peer_opts, cfg.default_mss);
+        }
+
+        /// The same, for a link that carries segments no larger than
+        /// `local_mss` (limitLocalMss), which has to be known before the
+        /// peer's options are: the smaller of the two is what is sent.
+        pub fn acceptFromSynMss(local_port: u16, isn: u32, now_ms: u64, peer_opts: options_mod.NegotiatedOptions, local_mss: u16) Self {
             var conn = Self{
                 .state = .listen,
                 .local_port = local_port,
                 .sender = SenderT.init(isn, cfg.default_mss),
             };
+            conn.limitLocalMss(local_mss);
             conn.applyPeerOptions(peer_opts);
             conn.sender.trackSyn(isn, now_ms);
             return conn;
@@ -776,8 +789,11 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         pub fn applyPeerOptions(self: *Self, opts: options_mod.NegotiatedOptions) void {
             // MSS
             if (opts.mss > 0) {
-                self.mss = opts.mss;
-                self.sender.setMss(opts.mss);
+                // No larger than this side's own: the peer's MSS is what it
+                // can take, and local_mss what this side's link can carry.
+                // A segment the size of the larger would not fit the
+                // smaller link (RFC 1122 4.2.2.6).
+                self.mss = @min(opts.mss, self.local_mss);
             }
 
             // Window Scale: enable if peer included WScale option in SYN (even with shift=0)
@@ -796,7 +812,40 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             if (opts.timestamps_enabled) {
                 self.timestamps_enabled = true;
             }
+
+            self.sender.setMss(self.segmentDataMax());
         }
+
+        /// What one segment carries: the MSS, less the timestamp's 12 bytes
+        /// when they are on. The MSS counts no options, and every data
+        /// segment here carries them: filled to the MSS, a segment is 12
+        /// bytes past what the path takes (RFC 7323 3, RFC 6691).
+        fn segmentDataMax(self: *const Self) u16 {
+            return if (self.timestamps_enabled) self.mss -| timestamp_option_len else self.mss;
+        }
+
+        /// Hold this side's segments to `mss` from now on, if that is
+        /// smaller than what they are held to: a smaller link (IPv6's
+        /// larger header) before the handshake, or a smaller path the
+        /// network reported after it (ICMP Fragmentation Needed, Packet
+        /// Too Big). Never larger: an MSS only comes down.
+        pub fn lowerMss(self: *Self, mss: u16) void {
+            if (mss == 0 or mss >= self.mss) return;
+            self.mss = mss;
+            self.sender.setMss(self.segmentDataMax());
+        }
+
+        /// The largest segment this side's link carries is `mss`: what the
+        /// SYN offers, and the most sent. For a connection that has not
+        /// yet agreed one.
+        pub fn limitLocalMss(self: *Self, mss: u16) void {
+            self.local_mss = @min(self.local_mss, mss);
+            self.lowerMss(self.local_mss);
+        }
+
+        /// What every segment after the handshake carries when timestamps
+        /// are on: two NOPs and the option (options.writeTimestamp).
+        const timestamp_option_len: u16 = 12;
 
         /// PAWS (Protection Against Wrapped Sequences) check.
         /// Returns true if the segment should be REJECTED (TSval is too old).
@@ -1912,4 +1961,51 @@ test "Connection: a connection still opening can be reset" {
         else => return error.TestUnexpectedResult,
     }
     try testing.expectEqual(State.closed, conn.state);
+}
+
+test "Connection: the MSS sent with is the smaller of the peer's and this side's own" {
+    const Small = ConnectionWith(.{ .default_mss = 1240 });
+    const big_peer = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1460 });
+    try testing.expectEqual(@as(u16, 1240), big_peer.mss);
+    try testing.expectEqual(@as(u16, 1240), big_peer.sender.mss);
+    const small_peer = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1000 });
+    try testing.expectEqual(@as(u16, 1000), small_peer.mss);
+    try testing.expectEqual(@as(u16, 1000), small_peer.sender.mss);
+}
+
+test "Connection: with timestamps on, a segment's data leaves room for them" {
+    // 1240 of data, the timestamp's 12 and 40 of headers would be 1292 on
+    // a 1280 link. The MSS stays what was agreed; what is put in a segment
+    // is 12 less.
+    const Small = ConnectionWith(.{ .default_mss = 1240 });
+    const ts = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1460, .timestamps_enabled = true });
+    try testing.expectEqual(@as(u16, 1240), ts.mss);
+    try testing.expectEqual(@as(u16, 1228), ts.sender.mss);
+    const no_ts = Small.acceptFromSyn(80, 1000, 0, .{ .mss = 1460 });
+    try testing.expectEqual(@as(u16, 1240), no_ts.sender.mss);
+}
+
+test "Connection: a smaller path leaves room for timestamps, and never raises the MSS" {
+    // ICMP Fragmentation Needed used to set the MSS straight to the path
+    // less 40, and segments with timestamps were 12 bytes past it again.
+    var ts = Connection.acceptFromSyn(80, 1000, 0, .{ .mss = 1460, .timestamps_enabled = true });
+    ts.lowerMss(1100);
+    try testing.expectEqual(@as(u16, 1100), ts.mss);
+    try testing.expectEqual(@as(u16, 1088), ts.sender.mss);
+    ts.lowerMss(1300);
+    try testing.expectEqual(@as(u16, 1100), ts.mss);
+    try testing.expectEqual(@as(u16, 1088), ts.sender.mss);
+
+    var plain = Connection.acceptFromSyn(80, 1000, 0, .{ .mss = 1460 });
+    plain.lowerMss(1100);
+    try testing.expectEqual(@as(u16, 1100), plain.sender.mss);
+}
+
+test "Connection: a link smaller than default_mss holds the offer and what is sent" {
+    const c = Connection.acceptFromSynMss(80, 1000, 0, .{ .mss = 1460 }, 1220);
+    try testing.expectEqual(@as(u16, 1220), c.local_mss);
+    try testing.expectEqual(@as(u16, 1220), c.mss);
+    const small_peer = Connection.acceptFromSynMss(80, 1000, 0, .{ .mss = 900 }, 1220);
+    try testing.expectEqual(@as(u16, 900), small_peer.sender.mss);
+    try testing.expectEqual(@as(u16, 1220), small_peer.local_mss);
 }

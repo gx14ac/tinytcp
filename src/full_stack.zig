@@ -93,6 +93,9 @@ pub fn FullStackWith(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
 /// Full integrated stack parameterized by Config and link endpoint type.
 pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Config, comptime LinkT: type) type {
+    // A packet is built in a 1500-byte buffer, and an IPv4 link carries
+    // at least 68 (RFC 791).
+    comptime std.debug.assert(cfg.link_mtu >= 68 and cfg.link_mtu <= 1500);
     const ConnectionT = tcp_connection.ConnectionWith(cfg);
     const SenderT = tcp_sender.SenderWith(cfg);
     const ReceiverT = tcp_receiver.ReceiverWith(cfg);
@@ -228,6 +231,9 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         v6_reassembler: ipv6_frag_mod.Reassembler = .{},
         // IP identification field counter
         ip_id_counter: u16 = 1,
+        /// The identification of the next IPv6 datagram this stack
+        /// fragments (emitUdpFragments6).
+        ip6_frag_id: u32 = 1,
         // Per-instance ephemeral port counter (49152–65535)
         ephemeral_port_counter: u16 = 49152,
         // Last timestamp passed to tick/injectPacket (for outbound timestamping)
@@ -967,9 +973,22 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .id = id,
                 .active = true,
             };
+            slot.conn.limitLocalMss(mss4);
             self.active_count += 1;
             self.hashInsert(idx);
             return @intCast(idx);
+        }
+
+        /// The largest TCP segment the link carries, for each family: the
+        /// link less the IP and TCP headers, and never past default_mss.
+        /// IPv6's header is 20 bytes larger, so its segments are 20 bytes
+        /// smaller. A link_mtu set alone is enough: a default_mss left at
+        /// Ethernet's would make every full segment too large for it.
+        const mss4: u16 = @min(cfg.default_mss, cfg.link_mtu - 40);
+        const mss6: u16 = @min(cfg.default_mss, cfg.link_mtu - 60);
+
+        fn localMss(v6: bool) u16 {
+            return if (v6) mss6 else mss4;
         }
 
         /// Initiate an outbound IPv6 connection (active open).
@@ -991,6 +1010,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .local_addr6 = self.local_addr6,
                 .remote_addr6 = remote_addr,
             };
+            slot.conn.limitLocalMss(mss6);
             self.active_count += 1;
             self.hashInsert(idx);
             return @intCast(idx);
@@ -1212,7 +1232,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             if (seg.include_syn_options) {
                 opts_len = opts_mod.writeSynOptions(&opts_buf, .{
-                    .mss = slot.conn.mss,
+                    .mss = slot.conn.local_mss,
                     .window_scale = slot.conn.our_wscale,
                     .sack_permitted = true,
                     .timestamps = slot.conn.timestamps_enabled,
@@ -1496,11 +1516,8 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             // Update the connection's MSS
             if (self.findConn(id)) |idx| {
-                const new_mss = next_hop_mtu -| 40; // IP(20) + TCP(20)
-                if (new_mss > 0 and new_mss < self.slotAt(idx).conn.mss) {
-                    self.slotAt(idx).conn.mss = new_mss;
-                    self.slotAt(idx).conn.sender.mss = new_mss;
-                }
+                // IP(20) + TCP(20); lowerMss leaves room for timestamps.
+                self.slotAt(idx).conn.lowerMss(next_hop_mtu -| 40);
             }
         }
 
@@ -1524,11 +1541,8 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             // emb_src = our local, emb_dst = remote
             if (self.findConn6(emb_dst6, emb_src6, emb_dst_port, emb_src_port)) |idx| {
-                const new_mss: u16 = @intCast(mtu -| 60); // IPv6(40) + TCP(20)
-                if (new_mss > 0 and new_mss < self.slotAt(idx).conn.mss) {
-                    self.slotAt(idx).conn.mss = new_mss;
-                    self.slotAt(idx).conn.sender.mss = new_mss;
-                }
+                // IPv6(40) + TCP(20); lowerMss leaves room for timestamps.
+                self.slotAt(idx).conn.lowerMss(@intCast(@min(mtu -| 60, 65535)));
             }
         }
 
@@ -1555,8 +1569,14 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         fn emitUdpPacket(self: *Self, src_addr: [4]u8, src_port: u16, dst_addr: [4]u8, dst_port: u16, data: []const u8) void {
+            if (udp_header.header_len + data.len > max_udp_len) return;
             const udp_len: u16 = @intCast(udp_header.header_len + data.len);
             const total_len: u16 = 20 + udp_len;
+
+            if (total_len > cfg.link_mtu) {
+                self.emitUdpFragments(src_addr, src_port, dst_addr, dst_port, data);
+                return;
+            }
 
             var buf: [1500]u8 = undefined;
             if (total_len > buf.len) return;
@@ -1600,10 +1620,147 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             _ = self.link.extract(&pb);
         }
 
+        /// The largest UDP datagram an IPv4 packet can carry.
+        const max_udp_len: usize = 65535 - 20;
+
+        /// A UDP datagram larger than the link takes, sent as IPv4 fragments
+        /// of at most `cfg.link_mtu` (RFC 791), which the receiver puts back
+        /// together. Built a fragment at a time, never whole: the datagram
+        /// can be 64KiB, and the stack sends from whatever thread polls it.
+        ///
+        /// Never Don't Fragment: these are the stack's own packets — a relay's
+        /// answer, typically — and splitting them here is what keeps a
+        /// large answer (a DNS response with EDNS, a QUIC handshake) from
+        /// being lost on a link smaller than the path it came over.
+        fn emitUdpFragments(self: *Self, src_addr: [4]u8, src_port: u16, dst_addr: [4]u8, dst_port: u16, data: []const u8) void {
+            const cksum_mod = @import("checksum.zig");
+            const udp_len: u16 = @intCast(udp_header.header_len + data.len);
+
+            // The UDP header, its checksum over the whole datagram.
+            var udp_hdr: [udp_header.header_len]u8 = undefined;
+            std.mem.writeInt(u16, udp_hdr[0..2], src_port, .big);
+            std.mem.writeInt(u16, udp_hdr[2..4], dst_port, .big);
+            std.mem.writeInt(u16, udp_hdr[4..6], udp_len, .big);
+            udp_hdr[6] = 0;
+            udp_hdr[7] = 0;
+            const ph = cksum_mod.pseudoHeaderIpv4(src_addr, dst_addr, 17, udp_len);
+            const raw = cksum_mod.finish(cksum_mod.accumulate(cksum_mod.accumulate(ph, &udp_hdr), data));
+            std.mem.writeInt(u16, udp_hdr[6..8], if (raw == 0) 0xFFFF else raw, .big);
+
+            // Every fragment but the last carries a multiple of 8 bytes.
+            const per_fragment: usize = (@as(usize, cfg.link_mtu) - 20) & ~@as(usize, 7);
+            const id = self.ip_id_counter;
+            self.ip_id_counter +%= 1;
+
+            var buf: [1500]u8 = undefined;
+            var offset: usize = 0; // into the UDP datagram: header, then data
+            while (offset < udp_len) {
+                const chunk = @min(per_fragment, udp_len - offset);
+                const more = offset + chunk < udp_len;
+
+                var ip_hdr = ipv4_header.MutableHeader.init(&buf) catch return;
+                ip_hdr.setTotalLen(@intCast(20 + chunk));
+                ip_hdr.setIdentification(id);
+                ip_hdr.setTtl(64);
+                ip_hdr.setProtocol(.udp);
+                ip_hdr.setSrcAddr(src_addr);
+                ip_hdr.setDstAddr(dst_addr);
+                const flags_offset: u16 = (if (more) @as(u16, 0x2000) else 0) | @as(u16, @intCast(offset / 8));
+                std.mem.writeInt(u16, buf[6..8], flags_offset, .big);
+                ip_hdr.computeChecksum();
+
+                const end = offset + chunk;
+                copyDatagram(buf[20..], &udp_hdr, data, offset, end);
+
+                var pb = @import("packet_buf.zig").PacketBuf.initWithData(buf[0..], 0, 20 + chunk);
+                _ = self.link.extract(&pb);
+                offset = end;
+            }
+        }
+
+        /// Bytes [from, to) of a UDP datagram, its header and then its data,
+        /// into `out`: one fragment's share of a datagram never put
+        /// together whole.
+        fn copyDatagram(out: []u8, udp_hdr: *const [udp_header.header_len]u8, data: []const u8, from: usize, to: usize) void {
+            var at: usize = 0;
+            var pos = from;
+            if (pos < udp_header.header_len) {
+                const n = @min(udp_header.header_len, to) - pos;
+                @memcpy(out[at .. at + n], udp_hdr[pos .. pos + n]);
+                at += n;
+                pos += n;
+            }
+            if (pos < to) {
+                const start = pos - udp_header.header_len;
+                const n = to - pos;
+                @memcpy(out[at .. at + n], data[start .. start + n]);
+            }
+        }
+
+        /// The IPv6 side of emitUdpFragments: a Fragment header (RFC 8200
+        /// 4.5) behind each fixed header, the same 32-bit identification in
+        /// every piece, and a multiple of 8 bytes in all but the last. Only
+        /// the source fragments over IPv6, and this is the source.
+        fn emitUdpFragments6(self: *Self, src_addr: [16]u8, src_port: u16, dst_addr: [16]u8, dst_port: u16, data: []const u8) void {
+            const cksum_mod = @import("checksum.zig");
+            const ip6_hlen: usize = 40;
+            const frag_hlen = ipv6_frag_mod.frag_hdr_len;
+            const udp_len: u16 = @intCast(udp_header.header_len + data.len);
+
+            var udp_hdr: [udp_header.header_len]u8 = undefined;
+            std.mem.writeInt(u16, udp_hdr[0..2], src_port, .big);
+            std.mem.writeInt(u16, udp_hdr[2..4], dst_port, .big);
+            std.mem.writeInt(u16, udp_hdr[4..6], udp_len, .big);
+            udp_hdr[6] = 0;
+            udp_hdr[7] = 0;
+            const ph = cksum_mod.pseudoHeaderIpv6(src_addr, dst_addr, 17, udp_len);
+            const raw = cksum_mod.finish(cksum_mod.accumulate(cksum_mod.accumulate(ph, &udp_hdr), data));
+            std.mem.writeInt(u16, udp_hdr[6..8], if (raw == 0) 0xFFFF else raw, .big);
+
+            const per_fragment: usize = (@as(usize, cfg.link_mtu) - ip6_hlen - frag_hlen) & ~@as(usize, 7);
+            const id = self.ip6_frag_id;
+            self.ip6_frag_id +%= 1;
+
+            var buf: [1500]u8 = undefined;
+            var offset: usize = 0;
+            while (offset < udp_len) {
+                const chunk = @min(per_fragment, udp_len - offset);
+                const end = offset + chunk;
+
+                var ip6 = ipv6_header.MutableHeader.init(buf[0..ip6_hlen]) catch return;
+                ip6.setPayloadLen(@intCast(frag_hlen + chunk));
+                ip6.setNextHeader(.fragment);
+                ip6.setHopLimit(64);
+                ip6.setSrcAddr(src_addr);
+                ip6.setDstAddr(dst_addr);
+                const fh = ipv6_frag_mod.FragHeader{
+                    .next_header = .udp,
+                    .frag_offset = @intCast(offset / 8),
+                    .more_fragments = end < udp_len,
+                    .identification = id,
+                };
+                fh.serialize(buf[ip6_hlen .. ip6_hlen + frag_hlen]);
+                copyDatagram(buf[ip6_hlen + frag_hlen ..], &udp_hdr, data, offset, end);
+
+                var pb = @import("packet_buf.zig").PacketBuf.initWithData(buf[0..], 0, ip6_hlen + frag_hlen + chunk);
+                _ = self.link.extract(&pb);
+                offset = end;
+            }
+        }
+
         fn emitUdpPacket6(self: *Self, src_port: u16, dst_addr: [16]u8, dst_port: u16, data: []const u8) void {
             const ip6_hlen: usize = 40;
+            // A UDP length past 16 bits needs a jumbogram, which nothing here
+            // sends.
+            if (udp_header.header_len + data.len > 65535) return;
             const udp_len: u16 = @intCast(udp_header.header_len + data.len);
             const total_len = ip6_hlen + @as(usize, udp_len);
+
+            // Larger than the link: in fragments, as over IPv4.
+            if (total_len > cfg.link_mtu) {
+                self.emitUdpFragments6(self.local_addr6, src_port, dst_addr, dst_port, data);
+                return;
+            }
 
             var buf: [1500]u8 = undefined;
             if (total_len > buf.len) return;
@@ -1659,7 +1816,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             // SYN cookie mode: when SYN queue is near full, respond statelessly
             if (half_open >= self.syn_cookie_threshold) {
-                return self.acceptConnStateless(now_ms, id, peer_seq, peer_wnd);
+                return self.acceptConnStateless(now_ms, id, peer_seq, peer_opts, v6);
             }
 
             return self.acceptConnNow(now_ms, id, peer_seq, peer_wnd, peer_opts, v6);
@@ -1687,7 +1844,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             slot.is_v6 = v6 != null;
             slot.local_addr6 = if (v6) |a| a.local else .{0} ** 16;
             slot.remote_addr6 = if (v6) |a| a.remote else .{0} ** 16;
-            slot.conn = ConnectionT.acceptFromSyn(id.local_port, isn, now_ms, peer_opts);
+            slot.conn = ConnectionT.acceptFromSynMss(id.local_port, isn, now_ms, peer_opts, localMss(v6 != null));
 
             // Process the SYN — produces SYN+ACK output
             const output = slot.conn.onSegment(now_ms, .{ .syn = true }, peer_seq, 0, peer_wnd, &.{});
@@ -1879,12 +2036,28 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         }
 
         /// Stateless SYN+ACK using SYN cookie (no connection state allocated).
-        fn acceptConnStateless(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_wnd: u16) Event {
-            _ = peer_wnd;
-            const cookie_isn = self.syn_cookie.generate(now_ms, id.remote_addr, id.remote_port, id.local_addr, id.local_port, 1460);
+        fn acceptConnStateless(self: *Self, now_ms: u64, id: ConnId, peer_seq: u32, peer_opts: @import("transport/tcp/options.zig").NegotiatedOptions, v6: ?V6Addrs) Event {
+            // What the cookie brings back is what the connection sends with:
+            // the smaller of what the peer takes and what this side's link
+            // carries. A SYN without the option means the least a host must
+            // take (RFC 9293 3.7.1): 536 over IPv4, 1220 over IPv6.
+            const local = localMss(v6 != null);
+            const peer_mss: u16 = if (peer_opts.mss > 0) peer_opts.mss else if (v6 != null) 1220 else 536;
+            const cookie_isn = self.syn_cookie.generate(now_ms, id.remote_addr, id.remote_port, id.local_addr, id.local_port, @min(peer_mss, local));
 
-            // Send SYN+ACK with cookie as ISN, no state allocated
-            self.buildAndSend(id, .{ .syn = true, .ack = true }, cookie_isn, peer_seq +% 1, 65535, &.{});
+            // Send SYN+ACK with cookie as ISN, no state allocated. It offers
+            // this side's MSS, the only option a cookie can stand behind:
+            // without it the peer would hold its segments to 536. Over the
+            // family the SYN came in on — ConnId only knows four bytes of
+            // a v6 address, and a SYN+ACK built from them goes out as IPv4.
+            var opts_buf: [4]u8 = undefined;
+            const opts_len = @import("transport/tcp/options.zig").writeSynOptions(&opts_buf, .{ .mss = local, .window_scale = null, .sack_permitted = false, .timestamps = false });
+            const flags: tcp_header.Flags = .{ .syn = true, .ack = true };
+            if (v6) |a| {
+                self.buildAndSend6Opts(a.local, a.remote, id.local_port, id.remote_port, flags, cookie_isn, peer_seq +% 1, 65535, &.{}, opts_buf[0..opts_len]);
+            } else {
+                self.buildAndSendEcnOpts(id, flags, cookie_isn, peer_seq +% 1, 65535, &.{}, 0, opts_buf[0..opts_len]);
+            }
             return .none;
         }
 
@@ -1915,6 +2088,10 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             const idx = self.allocSlot() orelse return .none;
             const our_isn = seg_ack -% 1;
+            // No larger than this side's own, whatever the cookie carried:
+            // a segment past it would not fit this side's link.
+            const local = localMss(v6 != null);
+            const mss = @min(cookie_mss, local);
 
             const slot = self.slotAt(idx);
             slot.id = id;
@@ -1930,9 +2107,10 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .state = .established,
                 .local_port = id.local_port,
                 .remote_port = id.remote_port,
-                .sender = SenderT.init(our_isn, cookie_mss),
+                .sender = SenderT.init(our_isn, mss),
                 .receiver = ReceiverT.init(seg_seq -% 1, @intCast(@min(cfg.recv_buf_size, 65535))),
-                .mss = cookie_mss,
+                .mss = mss,
+                .local_mss = local,
                 .last_activity_ms = now_ms,
             };
             slot.conn.sender.syn_sent = true;
@@ -1966,7 +2144,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             if (seg.include_syn_options) {
                 opts_len = opts_mod.writeSynOptions(&opts_buf, .{
-                    .mss = slot.conn.mss,
+                    .mss = slot.conn.local_mss,
                     .window_scale = slot.conn.our_wscale,
                     .sack_permitted = true,
                     .timestamps = slot.conn.timestamps_enabled,
@@ -4790,4 +4968,343 @@ test "FullStack chunked: one connection near the end keeps its chunk, and an old
     try testing.expectEqual(@as(usize, 0), stack.read(old, &buf));
     try testing.expectEqual(@as(usize, 0), stack.write(old, "late"));
     stack.close(old);
+}
+
+// ================================================================
+// UDP larger than the link: IPv4 fragments (cfg.link_mtu)
+// ================================================================
+
+const TunnelStack = FullStackWith(16, .{ .link_mtu = 1280 });
+
+/// Read every packet the stack queued and put the UDP datagram back
+/// together, checking each fragment on the way. Returns the datagram (UDP
+/// header and data) and how many fragments carried it.
+fn reassembleUdp(link_ep: *link_mod.ChannelEndpoint, out: []u8, mtu: usize) !struct { len: usize, fragments: usize } {
+    var len: usize = 0;
+    var fragments: usize = 0;
+    var id: ?u16 = null;
+    // The one fragment without More Fragments, and where it ends.
+    var lasts: usize = 0;
+    var last_end: usize = 0;
+    var pkt_buf: [1600]u8 = undefined;
+    while (link_ep.readOutbound(&pkt_buf)) |pkt| {
+        fragments += 1;
+        try testing.expect(pkt.len <= mtu);
+        const hdr = try ipv4_header.Header.parse(pkt);
+        try testing.expect(hdr.isChecksumValid());
+        try testing.expect(!hdr.dontFragment());
+        if (id) |i| try testing.expectEqual(i, hdr.identification()) else id = hdr.identification();
+        const off = @as(usize, hdr.fragmentOffset()) * 8;
+        const body = pkt[20..hdr.totalLen()];
+        if (hdr.moreFragments()) {
+            try testing.expectEqual(@as(usize, 0), body.len % 8);
+        } else {
+            lasts += 1;
+            last_end = off + body.len;
+        }
+        @memcpy(out[off .. off + body.len], body);
+        len = @max(len, off + body.len);
+    }
+    // Exactly one says it is the last, and it is: nothing ends after it.
+    try testing.expectEqual(@as(usize, 1), lasts);
+    try testing.expectEqual(len, last_end);
+    return .{ .len = len, .fragments = fragments };
+}
+
+test "FullStack: UDP larger than the link goes in fragments, which put back together are the datagram" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 100, 64, 0, 1 });
+    const peer: [4]u8 = .{ 100, 64, 0, 9 };
+    const behind: [4]u8 = .{ 8, 8, 8, 8 };
+    var data: [3000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7 + 3);
+
+    // An answer the size of a large DNS response or a QUIC handshake.
+    stack.udpEmitFrom(behind, 53, peer, 40000, &data);
+
+    var datagram: [4000]u8 = undefined;
+    const got = try reassembleUdp(&link_ep, &datagram, 1280);
+    // 8 + 3000 bytes in pieces of 1256 (1280 - 20, a multiple of 8).
+    try testing.expectEqual(@as(usize, 3), got.fragments);
+    try testing.expectEqual(@as(usize, 8 + data.len), got.len);
+    try testing.expectEqualSlices(u8, &data, datagram[8..got.len]);
+    try testing.expectEqual(@as(u16, 53), std.mem.readInt(u16, datagram[0..2], .big));
+    try testing.expectEqual(@as(u16, 40000), std.mem.readInt(u16, datagram[2..4], .big));
+    try testing.expectEqual(@as(u16, 8 + data.len), std.mem.readInt(u16, datagram[4..6], .big));
+    // The checksum covers the whole datagram, as if it had gone whole.
+    const cksum = @import("checksum.zig");
+    const ph = cksum.pseudoHeaderIpv4(behind, peer, 17, @intCast(got.len));
+    try testing.expectEqual(@as(u16, 0), cksum.finish(cksum.accumulate(ph, datagram[0..got.len])));
+}
+
+test "FullStack: UDP that fits the link goes whole, and one byte more does not" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 100, 64, 0, 1 });
+    var data: [1280 - 28 + 1]u8 = undefined;
+    @memset(&data, 0x5a);
+
+    stack.udpEmitFrom(.{ 8, 8, 8, 8 }, 53, .{ 100, 64, 0, 9 }, 40000, data[0 .. data.len - 1]);
+    try testing.expectEqual(@as(usize, 1), link_ep.outboundCount());
+    var pkt: [1600]u8 = undefined;
+    const whole = link_ep.readOutbound(&pkt).?;
+    try testing.expectEqual(@as(usize, 1280), whole.len);
+    try testing.expect(!(try ipv4_header.Header.parse(whole)).moreFragments());
+
+    stack.udpEmitFrom(.{ 8, 8, 8, 8 }, 53, .{ 100, 64, 0, 9 }, 40000, &data);
+    var datagram: [1600]u8 = undefined;
+    const got = try reassembleUdp(&link_ep, &datagram, 1280);
+    try testing.expectEqual(@as(usize, 2), got.fragments);
+    try testing.expectEqual(@as(usize, 8 + data.len), got.len);
+}
+
+test "FullStack: on an Ethernet-sized link, what used to be dropped now goes in fragments" {
+    // The default link takes 1500. A datagram past it was not sent at all.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 100, 64, 0, 1 });
+    var data: [2000]u8 = undefined;
+    @memset(&data, 1);
+    stack.udpEmitFrom(.{ 8, 8, 8, 8 }, 53, .{ 100, 64, 0, 9 }, 40000, &data);
+    var datagram: [2100]u8 = undefined;
+    const got = try reassembleUdp(&link_ep, &datagram, 1500);
+    try testing.expectEqual(@as(usize, 2), got.fragments);
+    try testing.expectEqual(@as(usize, 2008), got.len);
+}
+
+test "FullStack: a connection a cookie accepted sends no segment past this side's MSS" {
+    // Under a burst the stack answers SYNs with cookies, and what the
+    // cookie carried was Ethernet's 1460 whatever this side could take:
+    // on a 1280-byte link every full segment was too large to send.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelSmallMss.init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listen(80, 128);
+    stack.syn_cookie_threshold = 0;
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(10, pkt_buf[0..syn]);
+    const syn_ack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    const idx = switch (stack.injectPacket(20, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+
+    // Plenty to send: every segment it makes fits 1240 of data.
+    var big: [8000]u8 = undefined;
+    @memset(&big, 'x');
+    _ = stack.write(idx, &big);
+    var now: u64 = 30;
+    var segments: usize = 0;
+    while (now < 3000) : (now += 50) {
+        _ = stack.poll(now);
+        while (link_ep.readOutbound(&out_buf)) |pkt| {
+            try testing.expect(pkt.len <= 1280);
+            segments += 1;
+        }
+    }
+    try testing.expect(segments > 0);
+    try testing.expect(stack.conns[idx].conn.sender.mss <= 1240);
+}
+
+const TunnelSmallMss = FullStackWith(16, .{ .link_mtu = 1280, .default_mss = 1240 });
+
+// ================================================================
+// MSS by family and by what the peer offered
+// ================================================================
+
+/// A SYN offering `mss`, over IPv4 or IPv6 (for tests).
+fn buildSynWithMss(comptime Addr: type, src: Addr, src_port: u16, dst: Addr, dst_port: u16, seq: u32, mss: u16, out: []u8) usize {
+    const opt = [4]u8{ 2, 4, @intCast(mss >> 8), @intCast(mss & 0xff) };
+    const v6 = Addr == [16]u8;
+    const ip_hlen: usize = if (v6) 40 else 20;
+    // Built with the option as payload, then the data offset moved past
+    // it and the checksum taken again.
+    const total = if (v6)
+        buildTcp6Packet(src, src_port, dst, dst_port, seq, 0, .{ .syn = true }, 65535, &opt, out)
+    else
+        buildTcpPacket(src, src_port, dst, dst_port, seq, 0, .{ .syn = true }, 65535, &opt, out);
+    out[ip_hlen + 12] = 6 << 4;
+    const seg = out[ip_hlen..total];
+    seg[16] = 0;
+    seg[17] = 0;
+    const cksum = @import("checksum.zig");
+    const ph = if (v6) cksum.pseudoHeaderIpv6(src, dst, 6, @intCast(seg.len)) else cksum.pseudoHeaderIpv4(src, dst, 6, @intCast(seg.len));
+    std.mem.writeInt(u16, seg[16..18], cksum.finish(cksum.accumulate(ph, seg)), .big);
+    return total;
+}
+
+/// The MSS a SYN or SYN+ACK offers, 0 for none (for tests).
+fn offeredMss(raw: []const u8) u16 {
+    const ip_hlen: usize = if (raw[0] >> 4 == 6) 40 else 20;
+    const tcp = raw[ip_hlen..];
+    const hdr_len: usize = @as(usize, tcp[12] >> 4) * 4;
+    return @import("transport/tcp/options.zig").parseOptions(tcp[20..hdr_len]).mss;
+}
+
+test "FullStack: link_mtu alone holds TCP to the link, and IPv6 20 bytes lower" {
+    // default_mss left at Ethernet's 1460: link_mtu is what decides.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 10, 0, 0, 1 });
+    stack.setIpv6Addr(v6Addr(1));
+    _ = stack.listen(80, 128);
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    const syn4 = buildSynWithMss([4]u8, .{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 1460, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..syn4]);
+    try testing.expectEqual(@as(u16, 1240), offeredMss(link_ep.readOutbound(&out_buf).?));
+    // What this side offers is what its link takes, not the smaller of
+    // that and the peer's: each direction has its own.
+    const small = buildSynWithMss([4]u8, .{ 10, 0, 0, 3 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 536, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..small]);
+    try testing.expectEqual(@as(u16, 1240), offeredMss(link_ep.readOutbound(&out_buf).?));
+
+    const syn6 = buildSynWithMss([16]u8, v6Addr(2), 6000, v6Addr(1), 80, 3000, 1440, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..syn6]);
+    const syn_ack6 = link_ep.readOutbound(&out_buf).?;
+    try testing.expectEqual(@as(u16, 1220), offeredMss(syn_ack6));
+    const sa = parseTcp6FromRaw(syn_ack6).?;
+
+    // A v6 connection with plenty to send: nothing it sends is past the
+    // link. Its segments were 1300 bytes, and the link refused every one.
+    const ack_len = buildTcp6Packet(v6Addr(2), 6000, v6Addr(1), 80, 3001, sa.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    const idx = switch (stack.injectPacket(10, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u16, 1220), stack.conns[idx].conn.sender.mss);
+    var big: [8000]u8 = undefined;
+    @memset(&big, 'x');
+    _ = stack.write(idx, &big);
+    var full: usize = 0;
+    var now: u64 = 20;
+    while (now < 1000) : (now += 50) {
+        _ = stack.poll(now);
+        while (link_ep.readOutbound(&out_buf)) |pkt| {
+            try testing.expect(pkt.len <= 1280);
+            if (pkt.len == 1280) full += 1;
+        }
+    }
+    try testing.expect(full > 0);
+    try testing.expectEqual(@as(u64, 0), link_ep.outboundOversize());
+
+    // And an outbound connection, each family.
+    const c4 = stack.connect(0, .{ 10, 0, 0, 9 }, 443, 50000).?;
+    try testing.expectEqual(@as(u16, 1240), stack.conns[c4].conn.local_mss);
+    const c6 = stack.connect6(0, v6Addr(9), 443, 50001).?;
+    try testing.expectEqual(@as(u16, 1220), stack.conns[c6].conn.local_mss);
+}
+
+test "FullStack: a cookie keeps the MSS the peer offered, and its SYN+ACK offers this side's" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 10, 0, 0, 1 });
+    _ = stack.listen(80, 128);
+    stack.syn_cookie_threshold = 0;
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // A peer that takes no more than 536. The cookie used to carry this
+    // side's own MSS, and the connection sent 1240-byte segments to it.
+    const syn = buildSynWithMss([4]u8, .{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3000, 536, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..syn]);
+    const syn_ack_raw = link_ep.readOutbound(&out_buf).?;
+    // Without the option the peer would hold this side to 536 too.
+    try testing.expectEqual(@as(u16, 1240), offeredMss(syn_ack_raw));
+    const syn_ack = parseTcpFromRaw(syn_ack_raw).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 80, 3001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    const idx = switch (stack.injectPacket(10, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u16, 536), stack.conns[idx].conn.sender.mss);
+
+    var big: [4000]u8 = undefined;
+    @memset(&big, 'x');
+    _ = stack.write(idx, &big);
+    var now: u64 = 20;
+    var segments: usize = 0;
+    while (now < 1000) : (now += 50) {
+        _ = stack.poll(now);
+        while (link_ep.readOutbound(&out_buf)) |pkt| {
+            try testing.expect(parseTcpFromRaw(pkt).?.payload_len <= 536);
+            segments += 1;
+        }
+    }
+    try testing.expect(segments > 0);
+}
+
+test "FullStack: a v6 SYN answered with a cookie is answered over v6" {
+    // It went out as IPv4, to the last four bytes of the peer's address.
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 10, 0, 0, 1 });
+    stack.setIpv6Addr(v6Addr(1));
+    _ = stack.listen(80, 128);
+    stack.syn_cookie_threshold = 0;
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+
+    // No MSS offered: the cookie carries IPv6's least, 1220.
+    const syn = buildTcp6Packet(v6Addr(2), 6000, v6Addr(1), 80, 3000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..syn]);
+    const raw = link_ep.readOutbound(&out_buf).?;
+    const syn_ack = parseTcp6FromRaw(raw) orelse return error.NotIpv6;
+    try testing.expect(syn_ack.flags.syn and syn_ack.flags.ack);
+    try testing.expectEqualSlices(u8, &v6Addr(2), &syn_ack.dst_addr);
+    try testing.expectEqual(@as(u16, 1220), offeredMss(raw));
+
+    const ack_len = buildTcp6Packet(v6Addr(2), 6000, v6Addr(1), 80, 3001, syn_ack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    const idx = switch (stack.injectPacket(10, pkt_buf[0..ack_len])) {
+        .accepted => |i| i,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expect(stack.conns[idx].is_v6);
+    try testing.expect(stack.conns[idx].conn.sender.mss <= 1220);
+}
+
+test "FullStack: UDP over IPv6 larger than the link goes in fragments" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 10, 0, 0, 1 });
+    const us = v6Addr(1);
+    const them = v6Addr(2);
+    stack.setIpv6Addr(us);
+    const ep = stack.udpBind(53).?;
+    var data: [3000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 5 + 1);
+    try testing.expect(stack.udpSendTo6(ep, them, 40000, &data));
+
+    var datagram: [4000]u8 = undefined;
+    var len: usize = 0;
+    var fragments: usize = 0;
+    var lasts: usize = 0;
+    var id: ?u32 = null;
+    var pkt: [1600]u8 = undefined;
+    while (link_ep.readOutbound(&pkt)) |raw| {
+        fragments += 1;
+        try testing.expect(raw.len <= 1280);
+        try testing.expectEqual(@as(u8, 44), raw[6]); // a Fragment header
+        const fh = ipv6_frag_mod.FragHeader.parse(raw[40..]).?;
+        try testing.expectEqual(ipv6_header.NextHeader.udp, fh.next_header);
+        if (id) |i| try testing.expectEqual(i, fh.identification) else id = fh.identification;
+        const body = raw[48..];
+        try testing.expectEqual(@as(usize, std.mem.readInt(u16, raw[4..6], .big)), 8 + body.len);
+        const off = @as(usize, fh.frag_offset) * 8;
+        if (fh.more_fragments) try testing.expectEqual(@as(usize, 0), body.len % 8) else lasts += 1;
+        @memcpy(datagram[off .. off + body.len], body);
+        len = @max(len, off + body.len);
+    }
+    // 8 + 3000 in pieces of 1232 (1280 - 48, a multiple of 8).
+    try testing.expectEqual(@as(usize, 3), fragments);
+    try testing.expectEqual(@as(usize, 1), lasts);
+    try testing.expectEqual(@as(usize, 8 + data.len), len);
+    try testing.expectEqualSlices(u8, &data, datagram[8..len]);
+    const cksum = @import("checksum.zig");
+    const ph = cksum.pseudoHeaderIpv6(us, them, 17, @intCast(len));
+    try testing.expectEqual(@as(u16, 0), cksum.finish(cksum.accumulate(ph, datagram[0..len])));
+
+    // One that fits goes whole.
+    try testing.expect(stack.udpSendTo6(ep, them, 40000, data[0 .. 1280 - 48]));
+    const whole = link_ep.readOutbound(&pkt).?;
+    try testing.expectEqual(@as(usize, 1280), whole.len);
+    try testing.expectEqual(@as(u8, 17), whole[6]);
 }
