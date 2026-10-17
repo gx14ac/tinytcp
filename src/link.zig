@@ -25,9 +25,19 @@ pub fn LinkEndpoint(comptime Self: type) type {
 
 /// Parameterized in-memory channel endpoint for testing.
 pub fn ChannelEndpointWith(comptime queue_size: usize, comptime mtu: usize) type {
+    return ChannelEndpointSized(queue_size, queue_size, mtu);
+}
+
+/// The same, with a queue size for each way. A user that injects packets
+/// into the stack directly and only ever reads the outbound side needs
+/// room there for a burst — every connection's reply in one poll — and
+/// next to none inbound; equal sizes would spend as much again on a queue
+/// nothing fills.
+pub fn ChannelEndpointSized(comptime out_queue_size: usize, comptime in_queue_size: usize, comptime mtu: usize) type {
     return struct {
         const Self = @This();
-        const max_queue: usize = queue_size;
+        const max_queue: usize = out_queue_size;
+        const max_in_queue: usize = in_queue_size;
         const max_pkt: usize = mtu;
 
         out_bufs: [max_queue][max_pkt]u8 = undefined,
@@ -36,8 +46,16 @@ pub fn ChannelEndpointWith(comptime queue_size: usize, comptime mtu: usize) type
         out_tail: usize = 0,
         out_count: usize = 0,
 
-        in_bufs: [max_queue][max_pkt]u8 = undefined,
-        in_lens: [max_queue]u16 = [_]u16{0} ** max_queue,
+        /// Packets refused because the queue was full or the packet too
+        /// big, each way. Nothing else says a packet was lost here: the
+        /// stack's sends ignore the answer, and a TCP segment dropped at
+        /// this point is only seen as the far end's retransmission, seconds
+        /// later.
+        out_dropped: u64 = 0,
+        in_dropped: u64 = 0,
+
+        in_bufs: [max_in_queue][max_pkt]u8 = undefined,
+        in_lens: [max_in_queue]u16 = [_]u16{0} ** max_in_queue,
         in_head: usize = 0,
         in_tail: usize = 0,
         in_count: usize = 0,
@@ -47,9 +65,11 @@ pub fn ChannelEndpointWith(comptime queue_size: usize, comptime mtu: usize) type
         }
 
         pub fn extract(self: *Self, pkt: *const PacketBuf) bool {
-            if (self.out_count >= max_queue) return false;
             const data = pkt.data();
-            if (data.len > max_pkt) return false;
+            if (self.out_count >= max_queue or data.len > max_pkt) {
+                self.out_dropped += 1;
+                return false;
+            }
             @memcpy(self.out_bufs[self.out_tail][0..data.len], data);
             self.out_lens[self.out_tail] = @intCast(data.len);
             self.out_tail = (self.out_tail + 1) % max_queue;
@@ -58,10 +78,13 @@ pub fn ChannelEndpointWith(comptime queue_size: usize, comptime mtu: usize) type
         }
 
         pub fn writeInbound(self: *Self, data: []const u8) bool {
-            if (self.in_count >= max_queue or data.len > max_pkt) return false;
+            if (self.in_count >= max_in_queue or data.len > max_pkt) {
+                self.in_dropped += 1;
+                return false;
+            }
             @memcpy(self.in_bufs[self.in_tail][0..data.len], data);
             self.in_lens[self.in_tail] = @intCast(data.len);
-            self.in_tail = (self.in_tail + 1) % max_queue;
+            self.in_tail = (self.in_tail + 1) % max_in_queue;
             self.in_count += 1;
             return true;
         }
@@ -71,13 +94,16 @@ pub fn ChannelEndpointWith(comptime queue_size: usize, comptime mtu: usize) type
             const pkt_len = self.in_lens[self.in_head];
             if (pkt_len > out_buf.len) return null;
             @memcpy(out_buf[0..pkt_len], self.in_bufs[self.in_head][0..pkt_len]);
-            self.in_head = (self.in_head + 1) % max_queue;
+            self.in_head = (self.in_head + 1) % max_in_queue;
             self.in_count -= 1;
             return out_buf[0..pkt_len];
         }
 
         pub fn writeOutbound(self: *Self, data: []const u8) void {
-            if (self.out_count >= max_queue or data.len > max_pkt) return;
+            if (self.out_count >= max_queue or data.len > max_pkt) {
+                self.out_dropped += 1;
+                return;
+            }
             @memcpy(self.out_bufs[self.out_tail][0..data.len], data);
             self.out_lens[self.out_tail] = @intCast(data.len);
             self.out_tail = (self.out_tail + 1) % max_queue;
@@ -100,6 +126,16 @@ pub fn ChannelEndpointWith(comptime queue_size: usize, comptime mtu: usize) type
 
         pub fn inboundCount(self: *const Self) usize {
             return self.in_count;
+        }
+
+        /// How many outbound packets were refused, since the start.
+        pub fn outboundDropped(self: *const Self) u64 {
+            return self.out_dropped;
+        }
+
+        /// How many inbound packets were refused, since the start.
+        pub fn inboundDropped(self: *const Self) u64 {
+            return self.in_dropped;
         }
     };
 }
@@ -144,4 +180,46 @@ test "ChannelEndpoint: extract and readOutbound" {
     var out_buf: [1600]u8 = undefined;
     const sent = ep.readOutbound(&out_buf) orelse return error.TestUnexpectedResult;
     try testing.expectEqualSlices(u8, "hello", sent);
+}
+
+test "ChannelEndpoint: a full queue counts what it refuses, both ways" {
+    const Small = ChannelEndpointWith(2, 64);
+    var ep = Small.init();
+    var backing: [128]u8 = undefined;
+    var pb = PacketBuf.init(&backing, 16);
+    @memcpy((try pb.append(4))[0..4], "abcd");
+
+    try testing.expect(ep.extract(&pb));
+    try testing.expect(ep.extract(&pb));
+    try testing.expectEqual(@as(u64, 0), ep.outboundDropped());
+    try testing.expect(!ep.extract(&pb));
+    ep.writeOutbound("efgh");
+    try testing.expectEqual(@as(u64, 2), ep.outboundDropped());
+
+    try testing.expect(ep.writeInbound("ijkl"));
+    try testing.expect(ep.writeInbound("mnop"));
+    try testing.expect(!ep.writeInbound("qrst"));
+    // Too big is refused too, and counted.
+    const big = [_]u8{0} ** 65;
+    try testing.expect(!ep.writeInbound(&big));
+    try testing.expectEqual(@as(u64, 2), ep.inboundDropped());
+}
+
+test "ChannelEndpointSized: each way holds its own number" {
+    const Lopsided = ChannelEndpointSized(3, 1, 64);
+    var ep = Lopsided.init();
+    var backing: [128]u8 = undefined;
+    var pb = PacketBuf.init(&backing, 16);
+    @memcpy((try pb.append(4))[0..4], "abcd");
+    for (0..3) |_| try testing.expect(ep.extract(&pb));
+    try testing.expect(!ep.extract(&pb));
+    try testing.expect(ep.writeInbound("x"));
+    try testing.expect(!ep.writeInbound("y"));
+    // Round and round, inbound, with a queue of one.
+    var out: [64]u8 = undefined;
+    for (0..5) |_| {
+        _ = ep.inject(&out) orelse return error.Empty;
+        try testing.expect(ep.writeInbound("z"));
+    }
+    try testing.expect(@sizeOf(Lopsided) < @sizeOf(ChannelEndpointWith(3, 64)));
 }
