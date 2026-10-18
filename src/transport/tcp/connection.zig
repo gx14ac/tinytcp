@@ -818,7 +818,6 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         }
 
         fn onSegmentFinWait2(self: *Self, now_ms: u64, flags: tcp_header.Flags, seg_seq: u32, payload: []const u8) Output {
-            _ = now_ms;
             // Half-closed by this side only: the peer still sends, and
             // probes a closed window (onEmptySegment), as in established.
             if (payload.len > 0) {
@@ -832,7 +831,11 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             // The peer's FIN counts once it is taken, as in established.
             if (self.receiver.finTaken()) {
                 self.state = .time_wait;
-                self.sender.timer.setTimeWait(0);
+                // From now, not from zero: counted from zero, it had run
+                // out on any clock past two minutes, and the next poll
+                // closed the connection — with what the peer sent before
+                // its FIN still unread.
+                self.sender.timer.setTimeWait(now_ms);
                 return self.ackNow();
             }
             if (flags.fin) return self.ackNow();
@@ -2241,6 +2244,28 @@ test "Connection: with reading shut, data and its FIN together end the stream" {
     try testing.expectEqual(State.close_wait, conn.state);
     var buf: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), conn.read(&buf));
+}
+
+test "Connection: time_wait from fin_wait_2 lasts its time from when it began" {
+    var conn = makeEstablished();
+    conn.close();
+    const t0: u64 = 1_000_000; // a clock well past the time_wait duration
+    _ = conn.poll(t0); // our FIN
+    _ = conn.onSegment(t0 + 1, .{ .ack = true }, 2001, 1002, 65535, &.{});
+    try testing.expectEqual(State.fin_wait_2, conn.state);
+    _ = conn.onSegment(t0 + 2, .{ .ack = true, .psh = true }, 2001, 1002, 65535, "AB");
+    _ = conn.onSegment(t0 + 3, .{ .fin = true, .ack = true }, 2003, 1002, 65535, &.{});
+    try testing.expectEqual(State.time_wait, conn.state);
+
+    // Still there on the next poll, and what came before the FIN can be read.
+    _ = conn.poll(t0 + 4);
+    try testing.expectEqual(State.time_wait, conn.state);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), conn.read(&buf));
+
+    // And gone once its time is up.
+    _ = conn.poll(t0 + 3 + timer_mod.time_wait_duration_ms);
+    try testing.expectEqual(State.closed, conn.state);
 }
 
 test "Connection: after this side's FIN, a FIN ahead of a gap waits for the gap too" {
