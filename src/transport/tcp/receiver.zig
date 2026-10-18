@@ -244,6 +244,14 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             return 0;
         }
 
+        /// Whether the peer's FIN has been taken: everything before it is
+        /// in, and rcv_nxt has moved past it. A FIN that arrived ahead of a
+        /// gap is known (fin_received) and not yet taken — the stream has
+        /// not ended until the gap fills.
+        pub fn finTaken(self: *const Self) bool {
+            return self.fin_received and self.rcv_nxt == self.fin_seq +% 1;
+        }
+
         /// Process a FIN.
         pub fn onFin(self: *Self, fin_seq: u32) void {
             self.ack_needed = true;

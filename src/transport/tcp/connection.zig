@@ -744,19 +744,32 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             }
 
             // Process FIN
-            if (flags.fin) {
-                self.receiver.onFin(seg_seq +% @as(u32, @intCast(payload.len)));
+            if (flags.fin) self.receiver.onFin(seg_seq +% @as(u32, @intCast(payload.len)));
+
+            // The peer's stream ends where its FIN is taken, which for a
+            // FIN that came ahead of a gap is when the gap fills — by this
+            // segment or a later one. Moving to close_wait on the FIN itself
+            // stopped the gap ever filling: close_wait takes ACKs only, so
+            // the bytes before the FIN were refused for good.
+            if (self.receiver.finTaken()) {
                 self.state = .close_wait;
-                // Immediate ACK for FIN
-                return .{ .send = .{
-                    .flags = .{ .ack = true },
-                    .seq = self.sender.snd_nxt,
-                    .ack = self.receiver.rcv_nxt,
-                    .window = self.scaledWindow(),
-                } };
+                return self.ackNow();
             }
+            // Ahead of a gap: ACK where the stream has got to, which is
+            // what tells the peer the gap is there.
+            if (flags.fin) return self.ackNow();
 
             return .none;
+        }
+
+        /// An ACK for what has been received so far, sent now.
+        fn ackNow(self: *Self) Output {
+            return .{ .send = .{
+                .flags = .{ .ack = true },
+                .seq = self.sender.snd_nxt,
+                .ack = self.receiver.rcv_nxt,
+                .window = self.scaledWindow(),
+            } };
         }
 
         fn onSegmentFinWait1(self: *Self, now_ms: u64, flags: tcp_header.Flags, seg_seq: u32, seg_ack: u32, seg_wnd: u16, payload: []const u8) Output {
@@ -778,8 +791,10 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 self.receiver.onEmptySegment(seg_seq);
             }
 
-            if (flags.fin) {
-                self.receiver.onFin(seg_seq +% @as(u32, @intCast(payload.len)));
+            if (flags.fin) self.receiver.onFin(seg_seq +% @as(u32, @intCast(payload.len)));
+
+            // The peer's FIN counts once it is taken, as in established.
+            if (self.receiver.finTaken()) {
                 if (flags.ack and self.sender.fin_acked) {
                     // FIN+ACK: straight to TIME_WAIT
                     self.state = .time_wait;
@@ -788,18 +803,14 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     // Simultaneous close
                     self.state = .closing;
                 }
-                return .{ .send = .{
-                    .flags = .{ .ack = true },
-                    .seq = self.sender.snd_nxt,
-                    .ack = self.receiver.rcv_nxt,
-                    .window = self.scaledWindow(),
-                } };
+                return self.ackNow();
             }
 
             if (flags.ack and self.sender.fin_acked) {
                 self.state = .fin_wait_2;
             }
 
+            if (flags.fin) return self.ackNow();
             return .none;
         }
 
@@ -813,17 +824,15 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 self.receiver.onEmptySegment(seg_seq);
             }
 
-            if (flags.fin) {
-                self.receiver.onFin(seg_seq +% @as(u32, @intCast(payload.len)));
+            if (flags.fin) self.receiver.onFin(seg_seq +% @as(u32, @intCast(payload.len)));
+
+            // The peer's FIN counts once it is taken, as in established.
+            if (self.receiver.finTaken()) {
                 self.state = .time_wait;
                 self.sender.timer.setTimeWait(0);
-                return .{ .send = .{
-                    .flags = .{ .ack = true },
-                    .seq = self.sender.snd_nxt,
-                    .ack = self.receiver.rcv_nxt,
-                    .window = self.scaledWindow(),
-                } };
+                return self.ackNow();
             }
+            if (flags.fin) return self.ackNow();
             return .none;
         }
 
@@ -1729,12 +1738,12 @@ test "Connection: an ACK in close_wait still consumes the send buffer" {
     _ = conn.poll(11);
 
     // The peer half-closes: it is done sending, we are not.
-    _ = conn.onSegment(12, .{ .fin = true, .ack = true }, 2000, 1001, 65535, &.{});
+    _ = conn.onSegment(12, .{ .fin = true, .ack = true }, 2001, 1001, 65535, &.{});
     try testing.expectEqual(State.close_wait, conn.state);
 
     // It acks everything we sent. That has to leave the buffer empty, even
     // though the ACK arrived in close_wait rather than established.
-    _ = conn.onSegment(13, .{ .ack = true }, 2001, 1009, 65535, &.{});
+    _ = conn.onSegment(13, .{ .ack = true }, 2002, 1009, 65535, &.{});
     try testing.expectEqual(@as(usize, 0), conn.send_buf_len);
     try testing.expectEqual(@as(usize, 0), conn.send_buf_sent);
 
@@ -1757,7 +1766,7 @@ test "Connection: a window advertised in close_wait is used" {
 
     // The peer half-closes: done sending, still receiving, and with room
     // for four bytes.
-    _ = conn.onSegment(10, .{ .fin = true, .ack = true }, 2000, 1001, 4, &.{});
+    _ = conn.onSegment(10, .{ .fin = true, .ack = true }, 2001, 1001, 4, &.{});
     try testing.expectEqual(State.close_wait, conn.state);
 
     _ = conn.write("ABCDEFGH");
@@ -2178,4 +2187,59 @@ test "Connection: a SYN+ACK's window is read as it is, though scaling was agreed
     // After it, the scale applies.
     _ = conn.onSegment(20, .{ .ack = true }, 9001, 1001, 1000, &.{});
     try testing.expectEqual(@as(usize, 1000 << 7), remoteWindowOf(&conn));
+}
+
+test "Connection: a FIN ahead of a gap waits for the gap, and the bytes before it are taken" {
+    var conn = makeEstablished();
+
+    // The FIN at 2003, with the two bytes before it still on their way —
+    // a reordering, or a loss the peer is about to resend.
+    switch (conn.onSegment(10, .{ .fin = true, .ack = true }, 2003, 1001, 65535, &.{})) {
+        // ACKed where the stream has got to, which is the gap.
+        .send => |seg| try testing.expectEqual(@as(u32, 2001), seg.ack),
+        else => return error.TestUnexpectedResult,
+    }
+    // Not the end yet. close_wait here took ACKs only, so the two bytes were
+    // refused when they came, and the gap never filled.
+    try testing.expectEqual(State.established, conn.state);
+
+    // The gap fills, and the FIN with it.
+    switch (conn.onSegment(11, .{ .ack = true }, 2001, 1001, 65535, "AB")) {
+        .send => |seg| try testing.expectEqual(@as(u32, 2004), seg.ack),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.close_wait, conn.state);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), conn.read(&buf));
+    try testing.expectEqualSlices(u8, "AB", buf[0..2]);
+}
+
+test "Connection: after this side's FIN, a FIN ahead of a gap waits for the gap too" {
+    // fin_wait_1: the peer's FIN arrives before our own is acked.
+    {
+        var conn = makeEstablished();
+        conn.close();
+        _ = conn.poll(10); // our FIN, at 1001
+        try testing.expectEqual(State.fin_wait_1, conn.state);
+        _ = conn.onSegment(11, .{ .fin = true, .ack = true }, 2003, 1001, 65535, &.{});
+        try testing.expectEqual(State.fin_wait_1, conn.state);
+        _ = conn.onSegment(12, .{ .ack = true }, 2001, 1001, 65535, "AB");
+        try testing.expectEqual(State.closing, conn.state);
+        var buf: [8]u8 = undefined;
+        try testing.expectEqual(@as(usize, 2), conn.read(&buf));
+    }
+    // fin_wait_2: our FIN is acked, and the peer's comes ahead of a gap.
+    {
+        var conn = makeEstablished();
+        conn.close();
+        _ = conn.poll(10);
+        _ = conn.onSegment(11, .{ .ack = true }, 2001, 1002, 65535, &.{});
+        try testing.expectEqual(State.fin_wait_2, conn.state);
+        _ = conn.onSegment(12, .{ .fin = true, .ack = true }, 2003, 1002, 65535, &.{});
+        try testing.expectEqual(State.fin_wait_2, conn.state);
+        _ = conn.onSegment(13, .{ .ack = true }, 2001, 1002, 65535, "AB");
+        try testing.expectEqual(State.time_wait, conn.state);
+        var buf: [8]u8 = undefined;
+        try testing.expectEqual(@as(usize, 2), conn.read(&buf));
+    }
 }
