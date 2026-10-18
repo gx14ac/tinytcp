@@ -466,6 +466,15 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 // on the floor, and a fast retransmit asked for here is
                 // never served while nextPollAt keeps saying "poll me now".
                 .fin_wait_1, .fin_wait_2, .closing, .last_ack => {
+                    // Asked for a reset after this side's FIN, as close()
+                    // with SO_LINGER 0 after shutdown(SHUT_WR) is: the FIN
+                    // said this side was done sending, and the reset says it
+                    // is not reading either. Ignored here, the peer kept
+                    // sending to a connection nobody would read, until its
+                    // window closed and it waited out its own timeout.
+                    if (self.close_requested and self.linger_enabled and self.linger_ms == 0) {
+                        return self.abortClose();
+                    }
                     if (self.lingerExpired(now_ms)) return self.abortClose();
 
                     switch (self.senderActionToOutput(self.sender.poll(now_ms, 0, false))) {
@@ -1581,6 +1590,41 @@ test "Connection: linger timeout=0 sends RST on close" {
         else => return error.TestUnexpectedResult,
     }
     try testing.expectEqual(State.closed, conn.state);
+}
+
+test "Connection: linger timeout=0 after this side's FIN sends RST too" {
+    // fin_wait_1: our FIN not yet acked.
+    {
+        var conn = makeEstablished();
+        conn.close();
+        _ = conn.poll(10);
+        try testing.expectEqual(State.fin_wait_1, conn.state);
+        conn.setLinger(true, 0);
+        switch (conn.poll(11)) {
+            .send => |seg| try testing.expect(seg.flags.rst),
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqual(State.closed, conn.state);
+    }
+    // fin_wait_2: our FIN acked, the peer still sending.
+    {
+        var conn = makeEstablished();
+        conn.close();
+        _ = conn.poll(10);
+        _ = conn.onSegment(11, .{ .ack = true }, 2001, 1002, 65535, &.{});
+        try testing.expectEqual(State.fin_wait_2, conn.state);
+        _ = conn.onSegment(12, .{ .ack = true, .psh = true }, 2001, 1002, 65535, "AB");
+        _ = conn.poll(13); // the ACK for it
+        conn.setLinger(true, 0);
+        switch (conn.poll(14)) {
+            .send => |seg| {
+                try testing.expect(seg.flags.rst);
+                try testing.expectEqual(@as(u32, 1002), seg.seq);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        try testing.expectEqual(State.closed, conn.state);
+    }
 }
 
 test "Connection: linger timeout>0 aborts after deadline with unsent data" {
