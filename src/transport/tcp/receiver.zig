@@ -310,8 +310,22 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             if (copy_len == 0) return 0;
             const window_before = self.windowRaw();
 
+            @memcpy(dst[0..copy_len], self.store.slice()[0..copy_len]);
+            self.consume(copy_len, window_before);
+            return copy_len;
+        }
+
+        /// Drop what has been delivered, as a read that keeps none of it
+        /// would. For a side that has shut its reading: the bytes still
+        /// count as received, so rcv_nxt is where the peer has got to — the
+        /// ACK it is waiting on, and what a FIN after them is measured from.
+        pub fn discard(self: *Self) void {
+            if (self.buf_len == 0) return;
+            self.consume(self.buf_len, self.windowRaw());
+        }
+
+        fn consume(self: *Self, copy_len: usize, window_before: u32) void {
             const buf = self.store.slice();
-            @memcpy(dst[0..copy_len], buf[0..copy_len]);
 
             // Shift what is left forward — including the bytes held past
             // buf_len for segments that arrived out of order, which are
@@ -338,7 +352,6 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             if (window_after -| window_before >= self.swsThreshold() and window_after >= 2 * window_before) {
                 self.ack_needed = true;
             }
-            return copy_len;
         }
 
         /// A segment with nothing in it, other than a SYN or FIN. One that

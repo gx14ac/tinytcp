@@ -736,9 +736,12 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 self.sender.setRemoteWindow(self.applyRecvWscale(seg_wnd));
             }
 
-            // Process data (discard if read direction is shut down)
-            if (payload.len > 0 and !self.read_shutdown) {
+            // Process data. With the read direction shut, it is taken and
+            // then dropped, not refused: refused, it was never ACKed, so the
+            // peer resent it for good, and a FIN behind it was never taken.
+            if (payload.len > 0) {
                 _ = self.receiver.onSegment(seg_seq, payload);
+                if (self.read_shutdown) self.receiver.discard();
             } else if (payload.len == 0 and !flags.fin) {
                 self.receiver.onEmptySegment(seg_seq);
             }
@@ -2212,6 +2215,32 @@ test "Connection: a FIN ahead of a gap waits for the gap, and the bytes before i
     var buf: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 2), conn.read(&buf));
     try testing.expectEqualSlices(u8, "AB", buf[0..2]);
+}
+
+test "Connection: with reading shut, data is ACKed and dropped, and a FIN after it is taken" {
+    var conn = makeEstablished();
+    conn.shutdownRead();
+
+    _ = conn.onSegment(10, .{ .ack = true }, 2001, 1001, 65535, "AB");
+    // Taken, so the peer is told it arrived; refused, it was resent for good.
+    try testing.expectEqual(@as(u32, 2003), conn.receiver.rcv_nxt);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), conn.read(&buf));
+
+    switch (conn.onSegment(11, .{ .fin = true, .ack = true }, 2003, 1001, 65535, &.{})) {
+        .send => |seg| try testing.expectEqual(@as(u32, 2004), seg.ack),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.close_wait, conn.state);
+}
+
+test "Connection: with reading shut, data and its FIN together end the stream" {
+    var conn = makeEstablished();
+    conn.shutdownRead();
+    _ = conn.onSegment(10, .{ .fin = true, .ack = true }, 2001, 1001, 65535, "AB");
+    try testing.expectEqual(State.close_wait, conn.state);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), conn.read(&buf));
 }
 
 test "Connection: after this side's FIN, a FIN ahead of a gap waits for the gap too" {
