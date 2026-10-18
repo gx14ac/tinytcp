@@ -112,6 +112,10 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         linger_enabled: bool = false,
         linger_ms: u64 = 0,
         linger_deadline: u64 = 0,
+        // A reset asked for after the close (linger 0 set once close was
+        // requested): what the close was to send, and its FIN, go first,
+        // and the reset follows once the peer has acknowledged them.
+        reset_after_fin: bool = false,
 
         // Keepalive
         keepalive_enabled: bool = false,
@@ -220,9 +224,16 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// enabled=true, timeout_ms=0: abort (RST) on close.
         /// enabled=true, timeout_ms>0: wait up to timeout for data to drain.
         /// enabled=false: default graceful close (FIN).
+        ///
+        /// A reset asked for after close() waits for what the close was
+        /// sending: a relay whose upstream answered and then broke off still
+        /// owes the peer that answer, and a reset now would throw away
+        /// whatever of it the peer has not acknowledged. It follows in
+        /// fin_wait_2, once everything up to the FIN is acknowledged.
         pub fn setLinger(self: *Self, enabled: bool, timeout_ms: u64) void {
             self.linger_enabled = enabled;
             self.linger_ms = timeout_ms;
+            self.reset_after_fin = enabled and timeout_ms == 0 and self.close_requested;
         }
 
         /// Close with abort (RST). Used when linger timeout=0.
@@ -368,7 +379,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 },
                 .established, .close_wait => {
                     // SO_LINGER: if close requested with linger timeout=0, send RST immediately
-                    if (self.close_requested and self.linger_enabled and self.linger_ms == 0) {
+                    if (self.close_requested and self.linger_enabled and self.linger_ms == 0 and !self.reset_after_fin) {
                         return self.abortClose();
                     }
 
@@ -466,13 +477,16 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 // on the floor, and a fast retransmit asked for here is
                 // never served while nextPollAt keeps saying "poll me now".
                 .fin_wait_1, .fin_wait_2, .closing, .last_ack => {
-                    // Asked for a reset after this side's FIN, as close()
-                    // with SO_LINGER 0 after shutdown(SHUT_WR) is: the FIN
-                    // said this side was done sending, and the reset says it
-                    // is not reading either. Ignored here, the peer kept
+                    // A reset asked for after this side's FIN: the FIN said
+                    // this side was done sending, and the reset says it is
+                    // not reading either. Ignored here, the peer kept
                     // sending to a connection nobody would read, until its
-                    // window closed and it waited out its own timeout.
-                    if (self.close_requested and self.linger_enabled and self.linger_ms == 0) {
+                    // window closed and it waited out its own timeout. Only
+                    // in fin_wait_2, where everything sent is acknowledged:
+                    // earlier it would throw away what the peer has yet to
+                    // get. closing and last_ack end on that acknowledgement
+                    // anyway, with the peer done sending.
+                    if (self.state == .fin_wait_2 and self.close_requested and self.linger_enabled and self.linger_ms == 0) {
                         return self.abortClose();
                     }
                     if (self.lingerExpired(now_ms)) return self.abortClose();
@@ -1593,7 +1607,8 @@ test "Connection: linger timeout=0 sends RST on close" {
 }
 
 test "Connection: linger timeout=0 after this side's FIN sends RST too" {
-    // fin_wait_1: our FIN not yet acked.
+    // fin_wait_1: our FIN not yet acked. The reset waits for it, and goes
+    // once it is.
     {
         var conn = makeEstablished();
         conn.close();
@@ -1601,6 +1616,13 @@ test "Connection: linger timeout=0 after this side's FIN sends RST too" {
         try testing.expectEqual(State.fin_wait_1, conn.state);
         conn.setLinger(true, 0);
         switch (conn.poll(11)) {
+            .send => |seg| try testing.expect(!seg.flags.rst),
+            else => {},
+        }
+        try testing.expectEqual(State.fin_wait_1, conn.state);
+        _ = conn.onSegment(12, .{ .ack = true }, 2001, 1002, 65535, &.{});
+        try testing.expectEqual(State.fin_wait_2, conn.state);
+        switch (conn.poll(13)) {
             .send => |seg| try testing.expect(seg.flags.rst),
             else => return error.TestUnexpectedResult,
         }
@@ -1625,6 +1647,40 @@ test "Connection: linger timeout=0 after this side's FIN sends RST too" {
         }
         try testing.expectEqual(State.closed, conn.state);
     }
+}
+
+test "Connection: a reset asked for after close sends what the close was sending first" {
+    var conn = makeEstablished();
+    try testing.expectEqual(@as(usize, 5), conn.write("hello"));
+    conn.close();
+    conn.setLinger(true, 0);
+
+    // The data and the FIN, not a reset.
+    var sent: usize = 0;
+    var fin = false;
+    var now: u64 = 10;
+    while (now < 20) : (now += 1) {
+        switch (conn.poll(now)) {
+            .send => |seg| {
+                try testing.expect(!seg.flags.rst);
+                sent += seg.payload_len;
+                if (seg.flags.fin) fin = true;
+            },
+            else => break,
+        }
+    }
+    try testing.expectEqual(@as(usize, 5), sent);
+    try testing.expect(fin);
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+
+    // Acknowledged, data and FIN: now the reset.
+    _ = conn.onSegment(now, .{ .ack = true }, 2001, 1007, 65535, &.{});
+    try testing.expectEqual(State.fin_wait_2, conn.state);
+    switch (conn.poll(now + 1)) {
+        .send => |seg| try testing.expect(seg.flags.rst),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.closed, conn.state);
 }
 
 test "Connection: linger timeout>0 aborts after deadline with unsent data" {
