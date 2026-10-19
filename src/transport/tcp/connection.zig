@@ -810,9 +810,11 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             }
 
             // Process data. The peer still sends after this side's FIN, so
-            // it still probes a window this side closed, as in established.
+            // it still probes a window this side closed, as in established,
+            // and with reading shut what it sends is taken and dropped.
             if (payload.len > 0) {
                 _ = self.receiver.onSegment(seg_seq, payload);
+                if (self.read_shutdown) self.receiver.discard();
             } else if (!flags.fin) {
                 self.receiver.onEmptySegment(seg_seq);
             }
@@ -843,8 +845,10 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         fn onSegmentFinWait2(self: *Self, now_ms: u64, flags: tcp_header.Flags, seg_seq: u32, payload: []const u8) Output {
             // Half-closed by this side only: the peer still sends, and
             // probes a closed window (onEmptySegment), as in established.
+            // With reading shut, what it sends is taken and dropped.
             if (payload.len > 0) {
                 _ = self.receiver.onSegment(seg_seq, payload);
+                if (self.read_shutdown) self.receiver.discard();
             } else if (!flags.fin) {
                 self.receiver.onEmptySegment(seg_seq);
             }
@@ -2344,6 +2348,51 @@ test "Connection: with reading shut, data and its FIN together end the stream" {
     try testing.expectEqual(State.close_wait, conn.state);
     var buf: [8]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), conn.read(&buf));
+}
+
+test "Connection: with reading shut, data in fin_wait_1 is ACKed and dropped, and a FIN after it is taken" {
+    var conn = makeEstablished();
+    conn.shutdownRead();
+    conn.close();
+    _ = conn.poll(0); // our FIN, not yet ACKed
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+
+    _ = conn.onSegment(10, .{ .ack = true }, 2001, 1001, 65535, "AB");
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+    // Taken and dropped: kept, it filled a buffer nobody reads and closed
+    // the window on the peer.
+    try testing.expectEqual(@as(u32, 2003), conn.receiver.rcv_nxt);
+    try testing.expectEqual(@as(usize, 0), conn.receiver.buf_len);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), conn.read(&buf));
+
+    // Its FIN, without ACKing ours: a simultaneous close.
+    switch (conn.onSegment(11, .{ .fin = true }, 2003, 1001, 65535, &.{})) {
+        .send => |seg| try testing.expectEqual(@as(u32, 2004), seg.ack),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.closing, conn.state);
+}
+
+test "Connection: with reading shut, data in fin_wait_2 is ACKed and dropped, and a FIN after it is taken" {
+    var conn = makeEstablished();
+    conn.shutdownRead();
+    conn.close();
+    _ = conn.poll(0); // our FIN
+    _ = conn.onSegment(5, .{ .ack = true }, 2001, 1002, 65535, &.{});
+    try testing.expectEqual(State.fin_wait_2, conn.state);
+
+    _ = conn.onSegment(10, .{ .ack = true }, 2001, 1002, 65535, "AB");
+    try testing.expectEqual(@as(u32, 2003), conn.receiver.rcv_nxt);
+    try testing.expectEqual(@as(usize, 0), conn.receiver.buf_len);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), conn.read(&buf));
+
+    switch (conn.onSegment(11, .{ .fin = true, .ack = true }, 2003, 1002, 65535, &.{})) {
+        .send => |seg| try testing.expectEqual(@as(u32, 2004), seg.ack),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.time_wait, conn.state);
 }
 
 test "Connection: time_wait from fin_wait_2 lasts its time from when it began" {
