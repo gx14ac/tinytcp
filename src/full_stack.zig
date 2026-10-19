@@ -849,6 +849,13 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             slot.conn.close();
         }
 
+        /// Send what the connection holds, then reset it rather than close
+        /// it (Connection.resetWhenDrained).
+        pub fn resetWhenDrained(self: *Self, conn_idx: u16, timeout_ms: u64) void {
+            const slot = self.liveSlot(conn_idx) orelse return;
+            slot.conn.resetWhenDrained(timeout_ms);
+        }
+
         /// Shutdown write direction (send FIN, continue receiving).
         pub fn shutdownWrite(self: *Self, conn_idx: u16) void {
             const slot = self.liveSlot(conn_idx) orelse return;
@@ -5601,4 +5608,43 @@ test "FullStack: a slot taken again after a reset is told apart by its generatio
     const out = stack.connect(50, .{ 10, 0, 0, 9 }, 443, 50000).?;
     try testing.expect(stack.connGen(out).? != 0);
     try testing.expect(stack.connGen(out).? != stack.connGen(second).?);
+}
+
+test "FullStack: a connection asked to reset when drained sends what it holds, then resets and gives its slot back" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(4).init(&link_ep, .{ 10, 0, 0, 1 });
+    try testing.expect(stack.listen(80, 4));
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const syn_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 1 }, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(1, pkt_buf[0..syn_len]);
+    const synack = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    const ack_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 1 }, 80, 1001, synack.seq +% 1, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(2, pkt_buf[0..ack_len]);
+    const idx = stack.accept() orelse return error.NotAccepted;
+
+    try testing.expectEqual(@as(usize, 5), stack.write(idx, "hello"));
+    stack.resetWhenDrained(idx, 10_000);
+
+    // The data, and neither a FIN nor a reset while it is unacknowledged.
+    _ = stack.poll(3);
+    const data = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expectEqual(@as(usize, 5), data.payload_len);
+    try testing.expect(!data.flags.rst and !data.flags.fin);
+    _ = stack.poll(4);
+    try testing.expect(link_ep.readOutbound(&out_buf) == null);
+
+    // Acknowledged: the reset is due at once, and goes.
+    const ack2_len = buildTcpPacket(.{ 10, 0, 0, 2 }, 40000, .{ 10, 0, 0, 1 }, 80, 1001, data.seq +% 5, .{ .ack = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(5, pkt_buf[0..ack2_len]);
+    try testing.expectEqual(@as(?u64, 0), stack.nextPollAt());
+    switch (stack.poll(6)) {
+        .aborted => |i| try testing.expectEqual(idx, i),
+        else => return error.TestUnexpectedResult,
+    }
+    const rst = parseTcpFromRaw(link_ep.readOutbound(&out_buf).?).?;
+    try testing.expect(rst.flags.rst);
+    try testing.expectEqual(data.seq +% 5, rst.seq);
+    try testing.expectEqual(@as(u16, 0), stack.active_count);
 }

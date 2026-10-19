@@ -116,6 +116,12 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         // requested): what the close was to send, and its FIN, go first,
         // and the reset follows once the peer has acknowledged them.
         reset_after_fin: bool = false,
+        // A reset asked for once the peer has everything sent
+        // (resetWhenDrained), and the last moment it waits for that: set
+        // on the first poll after the ask, from drain_ms.
+        reset_when_drained: bool = false,
+        drain_ms: u64 = 0,
+        drain_deadline: ?u64 = null,
 
         // Keepalive
         keepalive_enabled: bool = false,
@@ -234,6 +240,30 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             self.linger_enabled = enabled;
             self.linger_ms = timeout_ms;
             self.reset_after_fin = enabled and timeout_ms == 0 and self.close_requested;
+        }
+
+        /// End with a reset once the peer has acknowledged every byte
+        /// written, or once `timeout_ms` has passed without that — never
+        /// with a FIN. For a relay whose upstream reset after sending: what
+        /// it already holds of the answer still reaches the peer, and the
+        /// end the peer sees is the one the upstream gave, a reset, rather
+        /// than a FIN that would say the answer was complete. A reset at
+        /// once, as linger 0 sends, throws the held part away too.
+        pub fn resetWhenDrained(self: *Self, timeout_ms: u64) void {
+            self.reset_when_drained = true;
+            self.drain_ms = timeout_ms;
+            self.drain_deadline = null;
+        }
+
+        /// Whether a reset asked for by resetWhenDrained is due: all of it
+        /// acknowledged, or out of time.
+        fn drainedOrExpired(self: *Self, now_ms: u64) bool {
+            if (!self.reset_when_drained) return false;
+            const deadline = self.drain_deadline orelse blk: {
+                self.drain_deadline = now_ms + self.drain_ms;
+                break :blk now_ms + self.drain_ms;
+            };
+            return self.send_buf_len == 0 or now_ms >= deadline;
         }
 
         /// Close with abort (RST). Used when linger timeout=0.
@@ -366,6 +396,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 // here sends a FIN, and SO_LINGER with no timeout means a
                 // reset, as it does from established.
                 .syn_received => {
+                    if (self.reset_when_drained) return self.abortClose();
                     if (self.close_requested and self.linger_enabled and self.linger_ms == 0) {
                         return self.abortClose();
                     }
@@ -384,9 +415,12 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     }
 
                     if (self.lingerExpired(now_ms)) return self.abortClose();
+                    if (self.drainedOrExpired(now_ms)) return self.abortClose();
 
                     const pending = self.send_buf_len - self.send_buf_sent;
-                    const has_fin = self.close_requested and pending == 0;
+                    // A connection that ends in a reset sends no FIN, even
+                    // if it is closed while it drains.
+                    const has_fin = self.close_requested and pending == 0 and !self.reset_when_drained;
 
                     const action = self.sender.poll(now_ms, pending, has_fin);
                     switch (action) {
@@ -490,6 +524,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                         return self.abortClose();
                     }
                     if (self.lingerExpired(now_ms)) return self.abortClose();
+                    if (self.drainedOrExpired(now_ms)) return self.abortClose();
 
                     switch (self.senderActionToOutput(self.sender.poll(now_ms, 0, false))) {
                         .none => {},
@@ -531,6 +566,15 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .established, .close_wait, .fin_wait_1, .fin_wait_2, .closing, .last_ack => return 0,
                 else => {},
             };
+            // A reset waiting on the peer goes when the last byte is
+            // acknowledged, which leaves nothing for the sender to wake for,
+            // or when its deadline comes.
+            if (self.reset_when_drained) {
+                const deadline = self.drain_deadline orelse return 0;
+                if (self.send_buf_len == 0) return 0;
+                const next = self.sender.nextPollAt() orelse return deadline;
+                return @min(next, deadline);
+            }
             return self.sender.nextPollAt();
         }
 
@@ -2395,5 +2439,117 @@ test "Connection: after this side's FIN, a FIN ahead of a gap waits for the gap 
         try testing.expectEqual(State.time_wait, conn.state);
         var buf: [8]u8 = undefined;
         try testing.expectEqual(@as(usize, 2), conn.read(&buf));
+    }
+}
+
+test "Connection: a reset when drained sends what is held first, and no FIN" {
+    var conn = makeEstablished();
+    try testing.expectEqual(@as(usize, 5), conn.write("hello"));
+    conn.resetWhenDrained(1_000);
+
+    switch (conn.poll(10)) {
+        .send => |seg| {
+            try testing.expect(!seg.flags.rst and !seg.flags.fin);
+            try testing.expectEqual(@as(usize, 5), seg.payload_len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // Unacknowledged: nothing more, and the next poll is for the
+    // retransmission or the deadline, not now.
+    try testing.expectEqual(Output.none, conn.poll(11));
+    try testing.expect(conn.nextPollAt().? > 11);
+
+    _ = conn.onSegment(12, .{ .ack = true }, 2001, 1006, 65535, &.{});
+    try testing.expectEqual(@as(?u64, 0), conn.nextPollAt());
+    switch (conn.poll(13)) {
+        .send => |seg| {
+            try testing.expect(seg.flags.rst);
+            try testing.expectEqual(@as(u32, 1006), seg.seq);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.closed, conn.state);
+}
+
+test "Connection: a reset when drained goes at its deadline if the peer never acknowledges" {
+    var conn = makeEstablished();
+    _ = conn.write("hello");
+    conn.resetWhenDrained(100);
+    _ = conn.poll(10); // the data; the deadline is 110
+    try testing.expectEqual(@as(?u64, 110), conn.nextPollAt());
+    switch (conn.poll(109)) {
+        .send => |seg| try testing.expect(!seg.flags.rst),
+        else => {},
+    }
+    try testing.expectEqual(State.established, conn.state);
+    switch (conn.poll(110)) {
+        .send => |seg| try testing.expect(seg.flags.rst),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(State.closed, conn.state);
+}
+
+test "Connection: a connection closed while it drains still ends in a reset, not a FIN" {
+    var conn = makeEstablished();
+    _ = conn.write("hello");
+    conn.resetWhenDrained(1_000);
+    conn.close();
+    var now: u64 = 10;
+    while (now < 20) : (now += 1) {
+        switch (conn.poll(now)) {
+            .send => |seg| try testing.expect(!seg.flags.fin and !seg.flags.rst),
+            else => break,
+        }
+    }
+    try testing.expectEqual(State.established, conn.state);
+    _ = conn.onSegment(now, .{ .ack = true }, 2001, 1006, 65535, &.{});
+    switch (conn.poll(now + 1)) {
+        .send => |seg| try testing.expect(seg.flags.rst and !seg.flags.fin),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a reset when drained with nothing held goes at once" {
+    var conn = makeEstablished();
+    conn.resetWhenDrained(1_000);
+    try testing.expectEqual(@as(?u64, 0), conn.nextPollAt());
+    switch (conn.poll(10)) {
+        .send => |seg| try testing.expect(seg.flags.rst),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a reset when drained asked for after this side's FIN goes once the FIN is acknowledged" {
+    var conn = makeEstablished();
+    _ = conn.write("hello");
+    conn.close();
+    var now: u64 = 10;
+    while (now < 20) : (now += 1) {
+        if (conn.poll(now) == .none) break;
+    }
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+    conn.resetWhenDrained(1_000);
+    switch (conn.poll(now)) {
+        .send => |seg| try testing.expect(!seg.flags.rst),
+        else => {},
+    }
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+    _ = conn.onSegment(now + 1, .{ .ack = true }, 2001, 1007, 65535, &.{});
+    try testing.expectEqual(@as(?u64, 0), conn.nextPollAt());
+    switch (conn.poll(now + 2)) {
+        .send => |seg| try testing.expect(seg.flags.rst),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "Connection: a reset when drained in the middle of a handshake goes at once" {
+    var conn = Connection.listen(80);
+    _ = conn.onSegment(1, .{ .syn = true }, 3000, 0, 65535, &.{});
+    try testing.expectEqual(State.syn_received, conn.state);
+    while (conn.poll(2) != .none) {}
+    conn.resetWhenDrained(1_000);
+    switch (conn.poll(3)) {
+        .send => |seg| try testing.expect(seg.flags.rst),
+        else => return error.TestUnexpectedResult,
     }
 }
