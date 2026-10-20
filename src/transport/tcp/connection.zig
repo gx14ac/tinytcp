@@ -254,13 +254,19 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// other one keeps going as it was: its deadline would never be set
         /// and nextPollAt would say "now" until it closed.
         pub fn resetWhenDrained(self: *Self, timeout_ms: u64) void {
-            switch (self.state) {
-                .syn_received, .established, .close_wait, .fin_wait_1, .fin_wait_2, .closing, .last_ack => {},
-                else => return,
-            }
+            if (!self.drainable()) return;
             self.reset_when_drained = true;
             self.drain_ms = timeout_ms;
             self.drain_deadline = null;
+        }
+
+        /// The states whose poll ends a connection asked to reset when
+        /// drained.
+        fn drainable(self: *const Self) bool {
+            return switch (self.state) {
+                .syn_received, .established, .close_wait, .fin_wait_1, .fin_wait_2, .closing, .last_ack => true,
+                else => false,
+            };
         }
 
         /// Whether a reset asked for by resetWhenDrained is due: all of it
@@ -576,8 +582,9 @@ pub fn ConnectionWith(comptime cfg: Config) type {
             };
             // A reset waiting on the peer goes when the last byte is
             // acknowledged, which leaves nothing for the sender to wake for,
-            // or when its deadline comes.
-            if (self.reset_when_drained) {
+            // or when its deadline comes. A connection that has moved on to
+            // time_wait since the ask has no such reset left to send.
+            if (self.reset_when_drained and self.drainable()) {
                 const deadline = self.drain_deadline orelse return 0;
                 if (self.send_buf_len == 0) return 0;
                 const next = self.sender.nextPollAt() orelse return deadline;
@@ -2565,6 +2572,19 @@ test "Connection: a reset when drained is not taken where poll would never send 
     conn.resetWhenDrained(1_000);
     try testing.expect(conn.nextPollAt() != @as(?u64, 0));
     try testing.expectEqual(State.time_wait, conn.state);
+}
+
+test "Connection: a reset when drained asked for in fin_wait_1 asks for no poll once the peer's FIN+ACK makes it time_wait" {
+    var conn = makeEstablished();
+    conn.close();
+    _ = conn.poll(10); // our FIN
+    try testing.expectEqual(State.fin_wait_1, conn.state);
+    conn.resetWhenDrained(1_000);
+    try testing.expect(conn.reset_when_drained);
+    _ = conn.onSegment(11, .{ .fin = true, .ack = true }, 2001, 1002, 65535, &.{});
+    try testing.expectEqual(State.time_wait, conn.state);
+    while (conn.poll(12) != .none) {}
+    try testing.expect(conn.nextPollAt() != @as(?u64, 0));
 }
 
 test "Connection: a reset when drained in the middle of a handshake goes at once" {
