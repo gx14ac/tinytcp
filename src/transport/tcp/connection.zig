@@ -249,7 +249,15 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// end the peer sees is the one the upstream gave, a reset, rather
         /// than a FIN that would say the answer was complete. A reset at
         /// once, as linger 0 sends, throws the held part away too.
+        ///
+        /// Only a connection that poll would end this way takes it. Any
+        /// other one keeps going as it was: its deadline would never be set
+        /// and nextPollAt would say "now" until it closed.
         pub fn resetWhenDrained(self: *Self, timeout_ms: u64) void {
+            switch (self.state) {
+                .syn_received, .established, .close_wait, .fin_wait_1, .fin_wait_2, .closing, .last_ack => {},
+                else => return,
+            }
             self.reset_when_drained = true;
             self.drain_ms = timeout_ms;
             self.drain_deadline = null;
@@ -2540,6 +2548,23 @@ test "Connection: a reset when drained asked for after this side's FIN goes once
         .send => |seg| try testing.expect(seg.flags.rst),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "Connection: a reset when drained is not taken where poll would never send it" {
+    var client = Connection.connect(5000, 80, 1000);
+    client.resetWhenDrained(1_000);
+    try testing.expect(!client.reset_when_drained);
+
+    var conn = makeEstablished();
+    conn.close();
+    _ = conn.poll(10); // our FIN
+    _ = conn.onSegment(11, .{ .ack = true }, 2001, 1002, 65535, &.{});
+    _ = conn.onSegment(12, .{ .fin = true, .ack = true }, 2001, 1002, 65535, &.{});
+    try testing.expectEqual(State.time_wait, conn.state);
+    while (conn.poll(13) != .none) {}
+    conn.resetWhenDrained(1_000);
+    try testing.expect(conn.nextPollAt() != @as(?u64, 0));
+    try testing.expectEqual(State.time_wait, conn.state);
 }
 
 test "Connection: a reset when drained in the middle of a handshake goes at once" {
