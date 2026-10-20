@@ -178,6 +178,8 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             received_ms: u64,
             is_v6: bool,
             remote_addr6: [16]u8,
+            /// Where a v6 SYN was sent: this node, or a host it relays for.
+            local_addr6: [16]u8,
         };
         const ReasmT = reassembly_mod.ReassemblerWith(8, cfg.max_reasm_datagram);
         const use_hash_index = max_conns > 32;
@@ -1090,6 +1092,14 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             return slot.id;
         }
 
+        /// The whole addresses of a v6 connection, which its ConnId keeps
+        /// only the low four bytes of. Null for a v4 one, or no connection.
+        pub fn connAddrs6(self: *const Self, conn_idx: u16) ?V6Addrs {
+            const slot = self.liveSlot(conn_idx) orelse return null;
+            if (!slot.is_v6) return null;
+            return .{ .local = slot.local_addr6, .remote = slot.remote_addr6 };
+        }
+
         /// Set TCP_NODELAY (disable Nagle algorithm) on a connection.
         pub fn setNoDelay(self: *Self, conn_idx: u16, enabled: bool) void {
             const slot = self.liveSlot(conn_idx) orelse return;
@@ -1230,12 +1240,26 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             self.emitUdpPacket(src_addr, src_port, dst_addr, dst_port, data);
         }
 
+        /// udpEmitFrom over IPv6: a relay answering a v6 peer from the
+        /// address and port it wrote to, which is not always this stack's
+        /// own v6 address.
+        pub fn udpEmitFrom6(
+            self: *Self,
+            src_addr: [16]u8,
+            src_port: u16,
+            dst_addr: [16]u8,
+            dst_port: u16,
+            data: []const u8,
+        ) void {
+            self.emitUdpPacket6(src_addr, src_port, dst_addr, dst_port, data);
+        }
+
         /// Send a UDP datagram to an IPv6 destination.
         pub fn udpSendTo6(self: *Self, ep_idx: u16, dst_addr: [16]u8, dst_port: u16, data: []const u8) bool {
             if (ep_idx >= max_udp_endpoints) return false;
             const slot = &self.udp_eps[ep_idx];
             if (!slot.active) return false;
-            self.emitUdpPacket6(slot.ep.local_port, dst_addr, dst_port, data);
+            self.emitUdpPacket6(self.local_addr6, slot.ep.local_port, dst_addr, dst_port, data);
             return true;
         }
 
@@ -1810,7 +1834,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             }
         }
 
-        fn emitUdpPacket6(self: *Self, src_port: u16, dst_addr: [16]u8, dst_port: u16, data: []const u8) void {
+        fn emitUdpPacket6(self: *Self, src_addr: [16]u8, src_port: u16, dst_addr: [16]u8, dst_port: u16, data: []const u8) void {
             const ip6_hlen: usize = 40;
             // A UDP length past 16 bits needs a jumbogram, which nothing here
             // sends.
@@ -1820,7 +1844,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
 
             // Larger than the link: in fragments, as over IPv4.
             if (total_len > cfg.link_mtu) {
-                self.emitUdpFragments6(self.local_addr6, src_port, dst_addr, dst_port, data);
+                self.emitUdpFragments6(src_addr, src_port, dst_addr, dst_port, data);
                 return;
             }
 
@@ -1832,7 +1856,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             ip6.setPayloadLen(udp_len);
             ip6.setNextHeader(.udp);
             ip6.setHopLimit(64);
-            ip6.setSrcAddr(self.local_addr6);
+            ip6.setSrcAddr(src_addr);
             ip6.setDstAddr(dst_addr);
 
             // Build UDP header
@@ -1852,7 +1876,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
             udp_seg[7] = 0;
             {
                 const cksum_mod = @import("checksum.zig");
-                const ph = cksum_mod.pseudoHeaderIpv6(self.local_addr6, dst_addr, 17, udp_len);
+                const ph = cksum_mod.pseudoHeaderIpv6(src_addr, dst_addr, 17, udp_len);
                 const raw = cksum_mod.finish(cksum_mod.accumulate(ph, udp_seg));
                 const cksum: u16 = if (raw == 0) 0xFFFF else raw;
                 std.mem.writeInt(u16, udp_seg[6..8], cksum, .big);
@@ -2001,6 +2025,7 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
                 .received_ms = ps.received_ms,
                 .is_v6 = ps.is_v6,
                 .remote_addr6 = ps.remote_addr6,
+                .local_addr6 = ps.local_addr6,
             };
         }
 
@@ -5512,6 +5537,115 @@ test "FullStack: UDP over IPv6 larger than the link goes in fragments" {
     const whole = link_ep.readOutbound(&pkt).?;
     try testing.expectEqual(@as(usize, 1280), whole.len);
     try testing.expectEqual(@as(u8, 17), whole[6]);
+}
+
+test "FullStack: udpEmitFrom6 answers from the address it is given, whole or in fragments" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 10, 0, 0, 1 });
+    stack.setIpv6Addr(v6Addr(1));
+    const them = v6Addr(2);
+    // A host the stack relays for: not its own v6 address.
+    var behind = v6Addr(5);
+    behind[1] = 0x99;
+    const cksum = @import("checksum.zig");
+
+    // No endpoint is bound, as for udpEmitFrom.
+    stack.udpEmitFrom6(behind, 53, them, 40000, "answer");
+    try testing.expectEqual(@as(usize, 0), stack.udp_count);
+    var pkt: [1600]u8 = undefined;
+    const whole = link_ep.readOutbound(&pkt).?;
+    try testing.expectEqual(@as(u8, 17), whole[6]);
+    try testing.expectEqualSlices(u8, &behind, whole[8..24]);
+    try testing.expectEqualSlices(u8, &them, whole[24..40]);
+    try testing.expectEqual(@as(u16, 53), std.mem.readInt(u16, whole[40..42], .big));
+    try testing.expectEqualStrings("answer", whole[48..]);
+    const ph = cksum.pseudoHeaderIpv6(behind, them, 17, @intCast(whole.len - 40));
+    try testing.expectEqual(@as(u16, 0), cksum.finish(cksum.accumulate(ph, whole[40..])));
+
+    // Larger than the link: every fragment is from the given address, and
+    // the checksum across them is over that address too.
+    var data: [3000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7 + 3);
+    stack.udpEmitFrom6(behind, 53, them, 40000, &data);
+    var datagram: [4000]u8 = undefined;
+    var len: usize = 0;
+    var fragments: usize = 0;
+    while (link_ep.readOutbound(&pkt)) |raw| {
+        fragments += 1;
+        try testing.expectEqual(@as(u8, 44), raw[6]);
+        try testing.expectEqualSlices(u8, &behind, raw[8..24]);
+        const fh = ipv6_frag_mod.FragHeader.parse(raw[40..]).?;
+        const off = @as(usize, fh.frag_offset) * 8;
+        const body = raw[48..];
+        @memcpy(datagram[off .. off + body.len], body);
+        len = @max(len, off + body.len);
+    }
+    try testing.expectEqual(@as(usize, 3), fragments);
+    try testing.expectEqualSlices(u8, &data, datagram[8..len]);
+    const ph2 = cksum.pseudoHeaderIpv6(behind, them, 17, @intCast(len));
+    try testing.expectEqual(@as(u16, 0), cksum.finish(cksum.accumulate(ph2, datagram[0..len])));
+}
+
+test "FullStack: udpSendTo6 still sends from the stack's own v6 address" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = TunnelStack.init(&link_ep, .{ 10, 0, 0, 1 });
+    const us = v6Addr(1);
+    stack.setIpv6Addr(us);
+    const ep = stack.udpBind(53).?;
+    try testing.expect(stack.udpSendTo6(ep, v6Addr(2), 40000, "answer"));
+    var pkt: [1600]u8 = undefined;
+    const raw = link_ep.readOutbound(&pkt).?;
+    try testing.expectEqualSlices(u8, &us, raw[8..24]);
+}
+
+test "FullStack: connAddrs6 gives a v6 connection's whole addresses, and nothing for v4" {
+    var link_ep = link_mod.ChannelEndpoint.init();
+    var stack = FullStack(16).init(&link_ep, .{ 10, 0, 0, 1 });
+    stack.setIpv6Addr(v6Addr(1));
+    _ = stack.listenDeferred(80, 128);
+
+    // Two peers whose addresses share the low four bytes, and a SYN for a
+    // host behind this node rather than for it.
+    var a = v6Addr(2);
+    var b = v6Addr(2);
+    a[1] = 0x01;
+    b[1] = 0x02;
+    var behind = v6Addr(5);
+    behind[1] = 0x99;
+
+    var pkt_buf: [128]u8 = undefined;
+    var out_buf: [1600]u8 = undefined;
+    const peers = [_][16]u8{ a, b };
+    var idxs: [2]u16 = undefined;
+    for (peers, 0..) |peer, i| {
+        const syn_len = buildTcp6Packet(peer, 5000, behind, 80, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+        const pending = switch (stack.injectPacket(0, pkt_buf[0..syn_len])) {
+            .syn_pending => |h| h,
+            else => return error.TestUnexpectedResult,
+        };
+        // The hold says where the SYN was sent, which a relay dials.
+        const info = stack.pendingSynInfo(pending.idx).?;
+        try testing.expectEqualSlices(u8, &behind, &info.local_addr6);
+        try testing.expectEqualSlices(u8, &peer, &info.remote_addr6);
+        idxs[i] = stack.acceptPending(pending, 10) orelse return error.NoConnection;
+        _ = link_ep.readOutbound(&out_buf);
+    }
+    for (peers, idxs) |peer, idx| {
+        const addrs = stack.connAddrs6(idx) orelse return error.NotV6;
+        try testing.expectEqualSlices(u8, &behind, &addrs.local);
+        try testing.expectEqualSlices(u8, &peer, &addrs.remote);
+    }
+
+    // A v4 connection has none.
+    _ = stack.listen(81, 128);
+    const syn4 = buildTcpPacket(.{ 10, 0, 0, 2 }, 6000, .{ 10, 0, 0, 1 }, 81, 1000, 0, .{ .syn = true }, 65535, &.{}, &pkt_buf);
+    _ = stack.injectPacket(0, pkt_buf[0..syn4]);
+    var v4_idx: ?u16 = null;
+    for (0..stack.slotCount()) |i| {
+        const slot = stack.slotAt(i);
+        if (slot.active and slot.id.local_port == 81) v4_idx = @intCast(i);
+    }
+    try testing.expectEqual(@as(?FullStack(16).V6Addrs, null), stack.connAddrs6(v4_idx orelse return error.NoV4Slot));
 }
 
 // ================================================================
