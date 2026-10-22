@@ -4962,9 +4962,10 @@ test "FullStack chunked: slots come a chunk at a time, and only when a connectio
 }
 
 /// What initAlloc gives against what `self.* = .{ ... }` gave, for a stack
-/// of type S, whose config has buf_budget `limit`: the fields whose default
-/// is undefined are left out.
-fn expectInitAllocSameAsLiteral(comptime S: type, limit: usize, comptime undefined_fields: []const []const u8) !void {
+/// of max_conns connections with config `cfg`: the fields whose default is
+/// undefined are left out.
+fn expectInitAllocSameAsLiteral(comptime max_conns: usize, comptime cfg: tcp_connection.Config, comptime undefined_fields: []const []const u8) !void {
+    const S = FullStackWith(max_conns, cfg);
     var link_ep = link_mod.ChannelEndpoint.init();
     const secret = [_]u8{0x31} ** 16;
     const want = try testing.allocator.create(S);
@@ -4977,7 +4978,7 @@ fn expectInitAllocSameAsLiteral(comptime S: type, limit: usize, comptime undefin
         .isn_gen = isn_mod.IsnGenerator.init(secret),
         .syn_cookie = syn_cookie_mod.SynCookie.init(secret),
         .allocator = testing.allocator,
-        .buf_budget = if (B == void) {} else B{ .parent = testing.allocator, .limit = limit },
+        .buf_budget = if (B == void) {} else B{ .parent = testing.allocator, .limit = cfg.buf_budget },
     };
     const got = try testing.allocator.create(S);
     defer testing.allocator.destroy(got);
@@ -4998,8 +4999,17 @@ test "FullStack initAlloc gives what a struct literal gave" {
         "conns[].id",
         "conns[].conn.sender.retx_queue",
     };
-    try expectInitAllocSameAsLiteral(ChunkedStack, 0, undefined_fields);
-    try expectInitAllocSameAsLiteral(GrowStack, 0, undefined_fields);
+    try expectInitAllocSameAsLiteral(48, .{ .conn_chunk = 16 }, undefined_fields);
+    try expectInitAllocSameAsLiteral(16, .{ .grow_buffers = true, .send_buf_size = 256 * 1024, .buf_initial = 4096 }, undefined_fields);
+    // Both at once, with a budget and more pending SYNs and listen ports
+    // than the defaults: how a stack that relays for a node is set up.
+    try expectInitAllocSameAsLiteral(64, .{
+        .conn_chunk = 16,
+        .grow_buffers = true,
+        .buf_budget = 8 * 1024 * 1024,
+        .max_pending_syns = 256,
+        .max_listen_ports = 32,
+    }, undefined_fields);
 }
 
 test "FullStack chunked: no more than max_conns, and a freed slot before a new chunk" {
