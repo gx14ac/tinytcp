@@ -31,6 +31,7 @@ const udp_endpoint = @import("transport/udp/endpoint.zig");
 const conntrack_mod = @import("conntrack.zig");
 const forwarder_mod = @import("forward/forwarder.zig");
 const checksum_mod = @import("checksum.zig");
+const init_fields = @import("init_fields.zig");
 
 const Connection = tcp_connection.Connection;
 const Segment = tcp_connection.Segment;
@@ -294,15 +295,22 @@ pub fn FullStackFull(comptime max_conns: usize, comptime cfg: tcp_connection.Con
         /// time (cfg.conn_chunk). Written in place: an inline stack is
         /// max_conns connections, which no thread's stack can hold as a
         /// temporary, and this one is small enough that it does not matter.
+        /// Field by field, too (init_fields.zig): `self.* = .{ ... }` puts
+        /// the defaults of the reassemblers, the pending SYNs and the
+        /// forwarder's flow table in the binary, about 180 KB of them.
         pub fn initAlloc(self: *Self, link_ep: *LinkT, local_addr: [4]u8, secret: [16]u8, allocator: std.mem.Allocator) void {
-            self.* = .{
+            init_fields.initFields(Self, self, .{
                 .link = link_ep,
                 .local_addr = local_addr,
                 .isn_gen = isn_mod.IsnGenerator.init(secret),
                 .syn_cookie = syn_cookie_mod.SynCookie.init(secret),
                 .allocator = allocator,
-                .buf_budget = if (cfg.grow_buffers) .{ .parent = allocator, .limit = cfg.buf_budget } else {},
-            };
+                .buf_budget = if (cfg.grow_buffers) byte_store.Budget{ .parent = allocator, .limit = cfg.buf_budget } else {},
+                // Its default is init(.{}), a value with no defaults of
+                // its own to write one at a time.
+                .forwarder = undefined,
+            });
+            self.forwarder.initIn(.{});
         }
 
         /// What every connection's grown buffers hold now, in bytes
@@ -4951,6 +4959,57 @@ test "FullStack chunked: slots come a chunk at a time, and only when a connectio
     _ = stack.injectPacket(1, pkt[0..data_len]);
     var got: [16]u8 = undefined;
     try testing.expectEqualStrings("hello", got[0..stack.read(idx17, &got)]);
+}
+
+/// What initAlloc gives against what `self.* = .{ ... }` gave, for a stack
+/// of max_conns connections with config `cfg`: the fields whose default is
+/// undefined are left out.
+fn expectInitAllocSameAsLiteral(comptime max_conns: usize, comptime cfg: tcp_connection.Config, comptime undefined_fields: []const []const u8) !void {
+    const S = FullStackWith(max_conns, cfg);
+    var link_ep = link_mod.ChannelEndpoint.init();
+    const secret = [_]u8{0x31} ** 16;
+    const want = try testing.allocator.create(S);
+    defer testing.allocator.destroy(want);
+    @memset(std.mem.asBytes(want), 0x5A);
+    const B = @TypeOf(want.buf_budget);
+    want.* = .{
+        .link = &link_ep,
+        .local_addr = .{ 10, 0, 0, 1 },
+        .isn_gen = isn_mod.IsnGenerator.init(secret),
+        .syn_cookie = syn_cookie_mod.SynCookie.init(secret),
+        .allocator = testing.allocator,
+        .buf_budget = if (B == void) {} else B{ .parent = testing.allocator, .limit = cfg.buf_budget },
+    };
+    const got = try testing.allocator.create(S);
+    defer testing.allocator.destroy(got);
+    @memset(std.mem.asBytes(got), 0x5A);
+    got.initAlloc(&link_ep, .{ 10, 0, 0, 1 }, secret, testing.allocator);
+    try init_fields.expectSameFields(S, want, got, undefined_fields);
+}
+
+test "FullStack initAlloc gives what a struct literal gave" {
+    const undefined_fields: []const []const u8 = &.{
+        "accept_queue",
+        "udp_eps[].ep.rx_queue[].data",
+        "udp_eps[].ep.tx_buf",
+        "reassembler.slots[].key",
+        "reassembler.slots[].buf",
+        "v6_reassembler.flows[].data",
+        // A stack without conn_chunk holds its connections inline.
+        "conns[].id",
+        "conns[].conn.sender.retx_queue",
+    };
+    try expectInitAllocSameAsLiteral(48, .{ .conn_chunk = 16 }, undefined_fields);
+    try expectInitAllocSameAsLiteral(16, .{ .grow_buffers = true, .send_buf_size = 256 * 1024, .buf_initial = 4096 }, undefined_fields);
+    // Both at once, with a budget and more pending SYNs and listen ports
+    // than the defaults: how a stack that relays for a node is set up.
+    try expectInitAllocSameAsLiteral(64, .{
+        .conn_chunk = 16,
+        .grow_buffers = true,
+        .buf_budget = 8 * 1024 * 1024,
+        .max_pending_syns = 256,
+        .max_listen_ports = 32,
+    }, undefined_fields);
 }
 
 test "FullStack chunked: no more than max_conns, and a freed slot before a new chunk" {
