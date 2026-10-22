@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const flow_table_mod = @import("flow_table.zig");
+const initFields = @import("../init_fields.zig").initFields;
 
 const FlowKey = flow_table_mod.FlowKey;
 const FlowEntry = flow_table_mod.FlowEntry;
@@ -87,6 +88,15 @@ pub fn Forwarder(comptime max_flows: usize) type {
                 .config = config,
                 .next_nat_port = config.nat_port_start,
             };
+        }
+
+        /// What init gives, written into `self`. A forwarder returned by
+        /// value is a constant of its whole size in the binary: its flow
+        /// table is entries with a default each.
+        pub fn initIn(self: *Self, config: Config) void {
+            initFields(flow_table_mod.FlowTable(max_flows), &self.flows, .{});
+            self.config = config;
+            self.next_nat_port = config.nat_port_start;
         }
 
         /// Decide what to do with an inbound packet (from tunnel).
@@ -210,6 +220,19 @@ pub fn Forwarder(comptime max_flows: usize) type {
 // ============================================================================
 
 const testing = std.testing;
+
+test "Forwarder: initIn gives what init gives" {
+    const F = Forwarder(256);
+    const cfg = Config{ .local_addr = .{ 100, 64, 0, 7 }, .exit_node = true, .nat_port_start = 40000 };
+    const want = try std.testing.allocator.create(F);
+    defer std.testing.allocator.destroy(want);
+    want.* = F.init(cfg);
+    const got = try std.testing.allocator.create(F);
+    defer std.testing.allocator.destroy(got);
+    @memset(std.mem.asBytes(got), 0x5A);
+    got.initIn(cfg);
+    try std.testing.expect(std.meta.eql(want.*, got.*));
+}
 
 test "Forwarder: local delivery" {
     var fwd = Forwarder(256).init(.{

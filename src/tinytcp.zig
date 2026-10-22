@@ -101,6 +101,7 @@ test {
     _ = @import("forward/forwarder.zig");
     _ = @import("tcp_stack.zig");
     _ = @import("isn.zig");
+    _ = @import("init_fields.zig");
     _ = @import("syn_cookie.zig");
     _ = @import("integration.zig");
     _ = @import("transport/tcp/endpoint.zig");
