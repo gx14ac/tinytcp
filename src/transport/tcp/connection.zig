@@ -446,7 +446,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                                 .flags = .{ .ack = true, .psh = true },
                                 .seq = d.seq,
                                 .ack = self.receiver.rcv_nxt,
-                                .window = self.scaledWindow(),
+                                .window = self.advertise(),
                                 .payload_offset = d.buf_offset,
                                 .payload_len = d.data_len,
                             } };
@@ -461,14 +461,14 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                                 .flags = .{ .fin = true, .ack = true },
                                 .seq = f.seq,
                                 .ack = self.receiver.rcv_nxt,
-                                .window = self.scaledWindow(),
+                                .window = self.advertise(),
                             } };
                         },
                         .send_syn => |s| {
                             return .{ .send = .{
                                 .flags = .{ .syn = true },
                                 .seq = s.seq,
-                                .window = self.synWindow(),
+                                .window = self.advertiseSyn(),
                                 .include_syn_options = true,
                             } };
                         },
@@ -485,7 +485,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                             .flags = .{ .ack = true },
                             .seq = self.sender.snd_nxt,
                             .ack = self.receiver.rcv_nxt,
-                            .window = self.scaledWindow(),
+                            .window = self.advertise(),
                         } };
                     }
 
@@ -508,7 +508,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                                 .flags = .{ .ack = true },
                                 .seq = self.sender.snd_nxt -% 1,
                                 .ack = self.receiver.rcv_nxt,
-                                .window = self.scaledWindow(),
+                                .window = self.advertise(),
                             } };
                         }
                     }
@@ -555,7 +555,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                             .flags = .{ .ack = true },
                             .seq = self.sender.snd_nxt,
                             .ack = self.receiver.rcv_nxt,
-                            .window = self.scaledWindow(),
+                            .window = self.advertise(),
                         } };
                     }
                     return .none;
@@ -710,7 +710,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .flags = .{ .syn = true, .ack = true },
                 .seq = self.sender.iss,
                 .ack = self.receiver.rcv_nxt,
-                .window = self.synWindow(),
+                .window = self.advertiseSyn(),
                 .include_syn_options = true,
             } };
         }
@@ -747,7 +747,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     .flags = .{ .ack = true },
                     .seq = self.sender.snd_nxt,
                     .ack = self.receiver.rcv_nxt,
-                    .window = self.scaledWindow(),
+                    .window = self.advertise(),
                 } };
             }
 
@@ -759,7 +759,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     .flags = .{ .syn = true, .ack = true },
                     .seq = self.sender.iss,
                     .ack = self.receiver.rcv_nxt,
-                    .window = self.synWindow(),
+                    .window = self.advertiseSyn(),
                     .include_syn_options = true,
                 } };
             }
@@ -853,7 +853,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                 .flags = .{ .ack = true },
                 .seq = self.sender.snd_nxt,
                 .ack = self.receiver.rcv_nxt,
-                .window = self.scaledWindow(),
+                .window = self.advertise(),
             } };
         }
 
@@ -934,7 +934,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                     return .{ .send = .{
                         .flags = .{ .syn = true },
                         .seq = s.seq,
-                        .window = self.synWindow(),
+                        .window = self.advertiseSyn(),
                         .include_syn_options = true,
                     } };
                 },
@@ -944,7 +944,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                         .flags = .{ .ack = true, .psh = true },
                         .seq = d.seq,
                         .ack = self.receiver.rcv_nxt,
-                        .window = self.scaledWindow(),
+                        .window = self.advertise(),
                         .payload_offset = d.buf_offset,
                         .payload_len = d.data_len,
                     } };
@@ -954,7 +954,7 @@ pub fn ConnectionWith(comptime cfg: Config) type {
                         .flags = .{ .fin = true, .ack = true },
                         .seq = f.seq,
                         .ack = self.receiver.rcv_nxt,
-                        .window = self.scaledWindow(),
+                        .window = self.advertise(),
                     } };
                 },
                 .abort => {
@@ -1111,6 +1111,22 @@ pub fn ConnectionWith(comptime cfg: Config) type {
         /// 64KiB window as 512 bytes for the first round trip.
         fn synWindow(self: *const Self) u16 {
             return @intCast(@min(self.receiver.windowRaw(), 65535));
+        }
+
+        /// The window for a segment about to go out, as scaledWindow
+        /// gives it, noted as what the peer will know (noteAdvertised):
+        /// whether a read later owes it an update is measured from there.
+        fn advertise(self: *Self) u16 {
+            const w = self.scaledWindow();
+            self.receiver.noteAdvertised(if (self.wscale_enabled) @as(u32, w) << self.rcv_wscale else w);
+            return w;
+        }
+
+        /// The same for a SYN or SYN+ACK, whose window is never scaled.
+        fn advertiseSyn(self: *Self) u16 {
+            const w = self.synWindow();
+            self.receiver.noteAdvertised(w);
+            return w;
         }
 
         /// Get our advertised window, scaled down for the wire (16-bit TCP header field).
