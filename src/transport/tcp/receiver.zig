@@ -106,6 +106,10 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         rcv_wnd: u32 = @intCast(@min(cfg.recv_buf_size, std.math.maxInt(u32))),
         /// Initial receive sequence number.
         irs: u32 = 0,
+        /// The right edge of the window as last told to the peer
+        /// (noteAdvertised): how far it believes it may send. What a read
+        /// that opens the window is measured against.
+        adv_edge: u32 = 0,
 
         /// Receive buffer: the bytes not yet read from [0, buf_len), then
         /// those of segments that arrived out of order, at their distance
@@ -168,6 +172,7 @@ pub fn ReceiverWith(comptime cfg: Config) type {
                 .rcv_nxt = irs +% 1, // After SYN is consumed
                 .rcv_wnd = win_size,
                 .irs = irs,
+                .adv_edge = (irs +% 1) +% win_size,
             };
         }
 
@@ -308,11 +313,23 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         pub fn read(self: *Self, dst: []u8) usize {
             const copy_len = @min(dst.len, self.buf_len);
             if (copy_len == 0) return 0;
-            const window_before = self.windowRaw();
 
             @memcpy(dst[0..copy_len], self.store.slice()[0..copy_len]);
-            self.consume(copy_len, window_before);
+            self.consume(copy_len);
             return copy_len;
+        }
+
+        /// A segment is going out carrying a window of `wnd` bytes (as the
+        /// peer will read it, after scaling): the peer now believes it may
+        /// send up to rcv_nxt + wnd.
+        pub fn noteAdvertised(self: *Self, wnd: u32) void {
+            self.adv_edge = self.rcv_nxt +% wnd;
+        }
+
+        /// The window the peer knows of: from what it has had acknowledged
+        /// to the edge last advertised. 0 once it has sent up to that edge.
+        pub fn peerWindow(self: *const Self) u32 {
+            return if (seqGt(self.adv_edge, self.rcv_nxt)) self.adv_edge -% self.rcv_nxt else 0;
         }
 
         /// Drop what has been delivered, as a read that keeps none of it
@@ -321,10 +338,10 @@ pub fn ReceiverWith(comptime cfg: Config) type {
         /// ACK it is waiting on, and what a FIN after them is measured from.
         pub fn discard(self: *Self) void {
             if (self.buf_len == 0) return;
-            self.consume(self.buf_len, self.windowRaw());
+            self.consume(self.buf_len);
         }
 
-        fn consume(self: *Self, copy_len: usize, window_before: u32) void {
+        fn consume(self: *Self, copy_len: usize) void {
             const buf = self.store.slice();
 
             // Shift what is left forward — including the bytes held past
@@ -342,14 +359,22 @@ pub fn ReceiverWith(comptime cfg: Config) type {
             self.rcv_wnd += @intCast(copy_len);
 
             // Tell the peer when reading has opened the window to twice
-            // what it was, and by at least a segment's worth. Nothing else
-            // would: a window the peer saw close stays closed for it until
-            // this side sends something, and a peer with nothing to say
-            // waits on its persist timer — and on a probe being answered —
-            // before sending again. Twice, as Linux does, so a reader
-            // taking a little at a time does not send an update for each.
+            // what it last heard, and by at least a segment's worth.
+            // Nothing else would: a window the peer saw close stays closed
+            // for it until this side sends something, and a peer with
+            // nothing to say waits on its persist timer — and on a probe
+            // being answered — before sending again. Twice, as Linux does,
+            // so a reader taking a little at a time does not send an update
+            // for each. Against what the peer heard — Linux's
+            // tcp_receive_window, the advertised right edge less rcv_nxt —
+            // not the window just before this read: a reader taking 4KiB at
+            // a time never doubles a window past 8KiB in one read, and the
+            // peer was left sending into a fraction of the room there was.
+            // A window the peer saw shut is opened at the SWS threshold,
+            // which is where gVisor sends its update too.
             const window_after = self.windowRaw();
-            if (window_after -| window_before >= self.swsThreshold() and window_after >= 2 * window_before) {
+            const known = self.peerWindow();
+            if (window_after -| known >= self.swsThreshold() and window_after >= 2 *| known) {
                 self.ack_needed = true;
             }
         }
@@ -847,6 +872,8 @@ test "Receiver: a read that opens a closed window owes the peer an update, and a
         seq +%= seg.len;
     }
     try testing.expectEqual(@as(u32, 0), rx.windowRaw());
+    // The ACK for the last of it told the peer the window was shut.
+    rx.noteAdvertised(rx.windowRaw());
     _ = rx.consumeAckNeeded();
 
     // Less than a segment's worth: the window stays shut on the wire.
@@ -858,11 +885,40 @@ test "Receiver: a read that opens a closed window owes the peer an update, and a
     _ = rx.read(out[0..4000]);
     try testing.expect(rx.ack_needed);
     _ = rx.consumeAckNeeded();
+    rx.noteAdvertised(rx.windowRaw());
 
     // Wider by more than a segment, but not twice as wide: no update for
     // every read.
     _ = rx.read(out[0..2000]);
     try testing.expect(!rx.ack_needed);
+}
+
+test "Receiver: a reader taking 4KiB at a time tells the peer once the window is twice what it knows" {
+    const Rx = ReceiverWith(.{ .recv_buf_size = 256 * 1024, .auto_tune_enabled = false });
+    var rx = Rx.init(1000, 256 * 1024);
+    var seg: [1024]u8 = undefined;
+    @memset(&seg, 'a');
+    var seq: u32 = 1001;
+    // 190KiB waiting to be read, and the peer told of the 66KiB left.
+    for (0..190) |_| {
+        _ = rx.onSegment(seq, &seg);
+        seq +%= seg.len;
+    }
+    rx.noteAdvertised(rx.windowRaw());
+    _ = rx.consumeAckNeeded();
+    const known = rx.peerWindow();
+    try testing.expectEqual(@as(u32, 66 * 1024), known);
+
+    // No single 4KiB read doubles a window this size, so measured against
+    // the window before each read there would be no update at all.
+    var out: [4096]u8 = undefined;
+    var reads: usize = 0;
+    while (!rx.ack_needed) : (reads += 1) {
+        try testing.expect(reads < 64);
+        try testing.expect(rx.windowRaw() < 2 * known);
+        _ = rx.read(&out);
+    }
+    try testing.expect(rx.windowRaw() >= 2 * known);
 }
 
 test "Receiver: a probe from behind rcv_nxt is answered, a plain ACK is not" {
